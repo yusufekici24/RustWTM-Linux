@@ -184,10 +184,12 @@ fn apply_smart(device: &mut Device) {
 }
 
 /// The display driver class; one numbered subkey per installed adapter driver.
+#[cfg_attr(not(windows), allow(dead_code))]
 const DISPLAY_CLASS: &str =
     r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
 
 /// Whether a driver's `MatchingDeviceId` names this PCI vendor and device.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn matches_hardware(matching_id: &str, vendor: u32, device: u32) -> bool {
     matching_id
         .to_ascii_lowercase()
@@ -195,6 +197,7 @@ fn matches_hardware(matching_id: &str, vendor: u32, device: u32) -> bool {
 }
 
 /// `M-D-YYYY` as the registry stores driver dates, as `YYYY-MM-DD`.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn iso_date(date: &str) -> Option<String> {
     let mut parts = date.trim().split('-').map(|p| p.parse::<u32>().ok());
     let (m, d, y) = (parts.next()??, parts.next()??, parts.next()??);
@@ -203,6 +206,7 @@ fn iso_date(date: &str) -> Option<String> {
 }
 
 /// `D3D_FEATURE_LEVEL_x_y` as `x_y`.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn feature_level_text(level: u32) -> Option<String> {
     let (major, minor) = ((level >> 12) & 0xf, (level >> 8) & 0xf);
     (major >= 9 && level & 0xff == 0 && level >> 16 == 0).then(|| format!("{major}_{minor}"))
@@ -211,6 +215,17 @@ fn feature_level_text(level: u32) -> Option<String> {
 /// The highest Direct3D 12 feature level Windows recorded for the adapter
 /// with this LUID. Read from the registry: creating a Direct3D device here
 /// would load the graphics driver into this process.
+#[cfg(target_os = "linux")]
+fn max_feature_level(_luid: u64) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn display_driver(vendor: u32, device: u32) -> Option<(String, Option<String>)> {
+    crate::linux_devices::display_driver(vendor, device)
+}
+
+#[cfg(windows)]
 fn max_feature_level(luid: u64) -> Option<String> {
     use winreg::RegKey;
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
@@ -228,6 +243,7 @@ fn max_feature_level(luid: u64) -> Option<String> {
 }
 
 /// Version and date of the installed driver for this adapter.
+#[cfg(windows)]
 fn display_driver(vendor: u32, device: u32) -> Option<(String, Option<String>)> {
     use winreg::RegKey;
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
@@ -339,11 +355,14 @@ pub fn collect() -> Result<Report, String> {
     let smart = SMART.get_or_init(Default::default);
     let now = std::time::Instant::now();
     let read = smart.lock().map(|s| smart_due(s.0, now)).unwrap_or(false);
+    #[cfg(windows)]
     let mut report = parse(crate::probe::json(
         include_str!("devices.ps1"),
         &serde_json::json!({ "smart": read }),
         Duration::from_secs(90),
     )?)?;
+    #[cfg(target_os = "linux")]
+    let mut report = parse(crate::linux_devices::probe(read)?)?;
     if let Ok(mut smart) = smart.lock() {
         if read {
             smart.0 = Some(now);
@@ -593,6 +612,7 @@ mod tests {
         assert_eq!(iso_date("2025-11-05"), None);
         assert_eq!(iso_date("1-2-3-4"), None);
     }
+    #[cfg(windows)]
     #[test]
     fn large_capacity_math_uses_scalars_without_allocating_memory() {
         let helpers = include_str!("devices.ps1")

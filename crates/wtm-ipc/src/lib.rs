@@ -781,6 +781,7 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
 
+    #[cfg(windows)]
     #[test]
     fn connect_gives_up_while_the_pipe_stays_busy() {
         let name = pipe_name();

@@ -30,11 +30,7 @@ pub fn path() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    std::env::var_os("LOCALAPPDATA").map(|d| {
-        PathBuf::from(d)
-            .join("RustWTM")
-            .join("container-history.json")
-    })
+    wtm_sys::compat::user_data_dir().map(|d| d.join("container-history.json"))
 }
 
 /// One minute of one container.

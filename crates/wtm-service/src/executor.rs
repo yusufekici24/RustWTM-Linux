@@ -644,8 +644,10 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 mod process_tests {
     use super::*;
+    #[cfg(windows)]
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use wtm_core::Sampler;
@@ -660,6 +662,7 @@ mod process_tests {
         }
     }
 
+    #[cfg(windows)]
     fn spawn() -> (Guard, ProcessRef) {
         // Wrapped at once so the child is reaped on every path.
         let child = Guard(
@@ -679,6 +682,7 @@ mod process_tests {
         (child, t)
     }
 
+    #[cfg(windows)]
     #[test]
     fn limits_left_by_a_failed_lift_are_lifted_on_the_next_tick() {
         let (_child, t) = spawn();
@@ -698,6 +702,7 @@ mod process_tests {
         assert!(!e.limiter.is_limited(&t));
     }
 
+    #[cfg(windows)]
     #[test]
     fn policies_never_end_or_suspend_service_hosts() {
         let mut e = Executor::new(false, EventLog::default());
@@ -742,6 +747,7 @@ mod process_tests {
         control::inspect(t).unwrap().priority
     }
 
+    #[cfg(windows)]
     #[test]
     fn sources_compose_and_roll_back_independently() {
         let (_child, t) = spawn();
@@ -800,6 +806,7 @@ mod process_tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn io_and_memory_priorities_take_the_lowest_and_roll_back() {
         let (_child, t) = spawn();
@@ -847,6 +854,7 @@ mod process_tests {
         assert!(e.managed().is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn manual_changes_survive_rollbacks() {
         let (_child, t) = spawn();
@@ -890,6 +898,7 @@ mod process_tests {
         assert!(e.managed().is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn failed_restores_recover_on_live_ticks_and_preserve_other_sources() {
         for other in [false, true] {
@@ -943,6 +952,7 @@ mod process_tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_failed_kill_keeps_the_live_process_available_for_rollback() {
         let (_child, target) = spawn();
@@ -967,6 +977,7 @@ mod process_tests {
         assert!(e.managed().is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn suspend_memory_cap_and_kill() {
         let (mut child, t) = spawn();
@@ -994,6 +1005,7 @@ mod process_tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn dry_run_logs_only_and_switching_rolls_back() {
         let (_child, t) = spawn();
@@ -1047,6 +1059,7 @@ mod process_tests {
         assert_eq!(e.managed()[0].sources, [Source::Manual]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn restoring_an_exited_process_is_reported_as_incomplete() {
         let (child, t) = spawn();
@@ -1081,6 +1094,7 @@ mod process_tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn exited_processes_are_forgotten_and_failures_reported() {
         let (child, t) = spawn();
@@ -1115,6 +1129,7 @@ mod process_tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn trim_memory_is_one_shot_and_announced() {
         let (_child, t) = spawn();

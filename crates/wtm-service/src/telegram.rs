@@ -2460,6 +2460,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn ending_by_name_asks_first_and_skips_protected_processes() {
         let (mut b, calls) = bot(true);

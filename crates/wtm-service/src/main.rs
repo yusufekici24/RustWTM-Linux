@@ -13,6 +13,7 @@ macro_rules! expect_reply {
 
 mod app_limits;
 mod app_power;
+#[cfg_attr(target_os = "linux", path = "linux/blocker.rs")]
 mod blocker;
 mod device_keys;
 mod engine;
@@ -23,6 +24,7 @@ mod history;
 mod ipc_server;
 mod logging;
 mod rescue;
+#[cfg_attr(target_os = "linux", path = "linux/service.rs")]
 mod service;
 #[cfg(feature = "telegram")]
 mod telegram;
@@ -60,7 +62,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Register as an auto-start Windows service running as LocalSystem (elevated)
+    /// Register as an auto-start service (Windows: LocalSystem; Linux: a
+    /// systemd unit running as root) (elevated)
     Install,
     /// Stop and remove the service, then clean up as `cleanup` does (elevated)
     Uninstall,
@@ -73,11 +76,12 @@ enum Command {
     Stop,
     /// Run the engine in the foreground; Ctrl+C stops and rolls back
     Console {
-        /// Directory holding config.toml and logs (default: %ProgramData%\RustWTM)
+        /// Directory holding config.toml and logs (default: %ProgramData%\RustWTM,
+        /// /var/lib/rustwtm on Linux)
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// Entry point used by the Service Control Manager
+    /// Entry point used by the Service Control Manager (systemd on Linux)
     #[command(hide = true)]
     Service,
     /// Make DIR a folder only SYSTEM and Administrators can change (used by

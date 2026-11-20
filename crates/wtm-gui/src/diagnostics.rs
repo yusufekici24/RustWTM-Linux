@@ -78,6 +78,20 @@ impl Facts {
 
 /// The Windows edition, version and build from the registry, without the
 /// registered owner or organization.
+#[cfg(target_os = "linux")]
+pub fn windows_version() -> String {
+    // "Ubuntu 24.04.1 LTS (kernel 6.8.0-49-generic)".
+    let release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let pretty = release
+        .lines()
+        .find_map(|l| l.strip_prefix("PRETTY_NAME="))
+        .map(|v| v.trim_matches('"').to_owned())
+        .unwrap_or_else(|| "Linux".into());
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    format!("{pretty} (kernel {})", kernel.trim())
+}
+
+#[cfg(windows)]
 pub fn windows_version() -> String {
     use winreg::RegKey;
     use winreg::enums::HKEY_LOCAL_MACHINE;
@@ -144,6 +158,9 @@ pub fn installed() -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
+    if cfg!(target_os = "linux") {
+        return exe.starts_with("/usr/bin");
+    }
     ["ProgramFiles", "ProgramW6432"]
         .iter()
         .filter_map(std::env::var_os)
@@ -183,6 +200,7 @@ mod tests {
         assert!(empty.contains("Windows: unknown") && empty.contains("Rights: standard user"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn nothing_personal_reaches_the_report() {
         let facts = Facts {

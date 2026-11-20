@@ -256,9 +256,9 @@ pub enum KeySource {
 }
 
 impl AiConfig {
-    /// `%APPDATA%\RustWTM\ai.toml`.
+    /// `%APPDATA%\RustWTM\ai.toml` (`~/.config/rustwtm/ai.toml` on Linux).
     pub fn path() -> Option<PathBuf> {
-        std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("RustWTM").join("ai.toml"))
+        wtm_sys::compat::user_config_dir().map(|d| d.join("ai.toml"))
     }
 
     pub fn from_toml(text: &str) -> Result<Self, String> {
@@ -288,7 +288,7 @@ impl AiConfig {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::path().ok_or("APPDATA is not set")?;
+        let path = Self::path().ok_or("no per-user settings folder (APPDATA / HOME is not set)")?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;

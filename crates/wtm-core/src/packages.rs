@@ -1,5 +1,6 @@
 //! Structured package identities and explicitly reviewed update plans.
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Package {
@@ -44,8 +45,14 @@ fn identity(s: &str) -> bool {
         && s.as_bytes()[0].is_ascii_alphanumeric()
         && s.len() <= 200
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
 }
+
+/// The package sources this platform updates from.
+#[cfg(windows)]
+const SOURCES: [&str; 2] = ["winget", "msstore"];
+#[cfg(target_os = "linux")]
+const SOURCES: [&str; 3] = ["apt", "snap", "flatpak"];
 impl UpdatePlan {
     pub fn new(selected: &[Package]) -> Result<Self, String> {
         if selected.is_empty() || selected.len() > 16 {
@@ -54,7 +61,7 @@ impl UpdatePlan {
         let mut ids = std::collections::HashSet::new();
         for p in selected {
             if !identity(&p.id)
-                || !matches!(p.source.as_str(), "winget" | "msstore")
+                || !SOURCES.contains(&p.source.as_str())
                 || p.installed.is_empty()
                 || !text(&p.installed)
                 || !text(&p.name)
@@ -75,11 +82,14 @@ impl UpdatePlan {
     }
 }
 pub fn inventory() -> Result<Inventory, String> {
+    #[cfg(windows)]
     let value = crate::probe::json(
         include_str!("packages.ps1"),
         &serde_json::json!({"operation":"inventory"}),
         Duration::from_secs(60),
     )?;
+    #[cfg(target_os = "linux")]
+    let value = linux_packages::inventory()?;
     let report: Inventory = serde_json::from_value(value).map_err(|e| e.to_string())?;
     if report.packages.len() > 1024
         || report.store.len() > 1024
@@ -111,12 +121,14 @@ pub fn inventory() -> Result<Inventory, String> {
 pub fn update(plan: &UpdatePlan) -> Result<Vec<UpdateResult>, String> {
     // Revalidate even when a caller constructed/deserialized the public plan directly.
     let plan = UpdatePlan::new(&plan.packages)?;
-    let input = serde_json::json!({"operation":"update","packages":plan.packages});
+    #[cfg(windows)]
     let value = crate::probe::json(
         include_str!("packages.ps1"),
-        &input,
+        &serde_json::json!({"operation":"update","packages":plan.packages}),
         Duration::from_secs(15 * 60),
     )?;
+    #[cfg(target_os = "linux")]
+    let value = linux_packages::update(&plan.packages)?;
     let results: Vec<UpdateResult> = serde_json::from_value(value).map_err(|e| e.to_string())?;
     if results.len() != plan.packages.len()
         || results
@@ -128,13 +140,17 @@ pub fn update(plan: &UpdatePlan) -> Result<Vec<UpdateResult>, String> {
     }
     Ok(results)
 }
+#[cfg(target_os = "linux")]
+#[path = "linux/packages.rs"]
+mod linux_packages;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn p() -> Package {
         Package {
             id: "Example.Editor".into(),
-            source: "winget".into(),
+            source: SOURCES[0].into(),
             name: "Editor".into(),
             installed: "1.0".into(),
             target: Some("2.0".into()),

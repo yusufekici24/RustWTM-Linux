@@ -233,7 +233,11 @@ impl Default for InsightsConfig {
             handle_min: 10_000,
             thread_growth_per_hour: 50.0,
             thread_min: 500,
-            exempt: vec!["explorer.exe".into(), "Taskmgr.exe".into()],
+            exempt: if cfg!(windows) {
+                vec!["explorer.exe".into(), "Taskmgr.exe".into()]
+            } else {
+                vec!["gnome-shell".into(), "rustwtm".into()]
+            },
         }
     }
 }
@@ -662,6 +666,7 @@ mod tests {
         assert!(actions_for(FindingKind::ThreadGrowth, &cfg).is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn analyze_flags_chronic_cpu_and_growth() {
         let cfg = InsightsConfig::default();
@@ -686,6 +691,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn policy_applies_to_all_instances_and_restores_when_cleared() {
         let cfg = InsightsConfig::default();
@@ -719,6 +725,7 @@ mod tests {
         assert_eq!(pids, [1, 2, 5]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn policy_matches_non_ascii_names_by_lowercase() {
         let cfg = InsightsConfig::default();
@@ -854,6 +861,7 @@ mod tests {
         assert_eq!(apps, ["a.exe", "b.exe", "c.exe"]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_later_finding_reaches_running_instances_and_each_clears_alone() {
         let cfg = InsightsConfig {

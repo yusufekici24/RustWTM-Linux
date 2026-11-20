@@ -57,6 +57,7 @@ pub fn load_color(percent: f32) -> Color32 {
 /// locale) is not enough. The "UI" faces share Segoe UI's vertical metrics,
 /// so mixed Latin and East Asian text stays on one baseline. Only this one
 /// font is loaded; other scripts use the system fallback.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn east_asian_font() -> Option<(&'static str, u32)> {
     use crate::i18n::Language;
     match Language::current() {
@@ -72,6 +73,53 @@ fn east_asian_font() -> Option<(&'static str, u32)> {
 /// status marks and controls. Fall back to egui's bundled fonts if unavailable.
 /// Fonts stay on the machine; none are copied into the distribution.
 /// Call again after the language changes.
+#[cfg(target_os = "linux")]
+pub fn install_fonts(ctx: &egui::Context) {
+    // The desktop's UI font (Ubuntu's, else Noto or DejaVu, which every
+    // Ubuntu install has), then CJK for East Asian names and symbols.
+    let mut fonts = egui::FontDefinitions::default();
+    let candidates: [(&str, &[&str], bool); 3] = [
+        (
+            "Desktop UI",
+            &[
+                "/usr/share/fonts/truetype/ubuntu/Ubuntu[wdth,wght].ttf",
+                "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ],
+            true,
+        ),
+        (
+            "Desktop CJK",
+            &["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"],
+            false,
+        ),
+        (
+            "Desktop symbols",
+            &["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+            false,
+        ),
+    ];
+    for (name, files, primary) in candidates {
+        let Some(bytes) = files.iter().find_map(|f| std::fs::read(f).ok()) else {
+            continue;
+        };
+        fonts.font_data.insert(
+            name.into(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        for (family, names) in &mut fonts.families {
+            if primary && *family == egui::FontFamily::Proportional {
+                names.insert(0, name.into());
+            } else if !primary {
+                names.push(name.into());
+            }
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+#[cfg(windows)]
 pub fn install_fonts(ctx: &egui::Context) {
     let Some(windows) = std::env::var_os("WINDIR") else {
         return;

@@ -312,8 +312,10 @@ fn add(job: &Job, p: &ProcessInfo) -> wtm_sys::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
@@ -329,6 +331,7 @@ mod tests {
     }
 
     /// A copy of cmd.exe with a unique name that starts a ping child.
+    #[cfg(windows)]
     fn spawn_app(dir: &std::path::Path, name: &str) -> Guard {
         static NEXT_OUTPUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let exe = dir.join(name);
@@ -405,6 +408,7 @@ mod tests {
         events.after(0).into_iter().map(|e| e.message).collect()
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_budget_whose_launcher_left_is_lifted_not_dropped() {
         let dir = std::env::temp_dir().join(format!("wtm-applaunch-{}", std::process::id()));
@@ -445,6 +449,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn limits_apps_with_their_children_and_lifts_on_change() {
         let dir = std::env::temp_dir().join(format!("wtm-applimit-{}", std::process::id()));
@@ -636,6 +641,7 @@ mod tests {
         assert_eq!(alerts(&events).len(), 3);
     }
 
+    #[cfg(windows)]
     #[test]
     fn failures_are_reported() {
         let events = EventLog::default();
@@ -681,6 +687,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn processes_in_foreign_jobs_are_counted_not_reported_one_by_one() {
         let dir = std::env::temp_dir().join(format!("wtm-applimit-foreign-{}", std::process::id()));

@@ -1,0 +1,22 @@
+[Unit]
+Description=RustWTM Governor: keeps the system responsive by throttling processes that overload the CPU
+Documentation=https://github.com/rustwtm/rustwtm
+After=local-fs.target systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wtm-service service
+Restart=on-failure
+RestartSec=5
+# The governor must keep working when the machine is overloaded.
+Nice=-5
+OOMScoreAdjust=-900
+CPUWeight=1000
+IOWeight=1000
+# Processes moved into job scopes and blocked-network scopes are not the
+# service's: stopping it must not end them.
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

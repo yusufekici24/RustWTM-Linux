@@ -88,6 +88,45 @@ jobs:
       - name: Website package publication controls
         run: python scripts/ci/test-publish-website-media.py
 
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-3-dev libxdo-dev \
+            libayatana-appindicator3-dev shellcheck
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test
+        timeout-minutes: 30
+        run: cargo test --locked --workspace
+
+      - name: Lint shell scripts
+        run: shellcheck packaging/linux/build-deb.sh packaging/linux/debian/* scripts/linux/*.sh
+
+      - name: Package
+        run: |
+          packaging/linux/build-deb.sh
+          dpkg-deb --info dist/rustwtm_*_amd64.deb
+          dpkg-deb --contents dist/rustwtm_*_amd64.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustwtm-linux-deb
+          path: dist/rustwtm_*_amd64.deb*
+
   coverage:
     runs-on: windows-latest
     steps:

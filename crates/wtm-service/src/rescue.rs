@@ -595,6 +595,7 @@ fn cpu_names(split: &RescueSplit) -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -615,6 +616,7 @@ mod tests {
         s
     }
 
+    #[cfg(windows)]
     #[test]
     fn engages_confines_new_processes_and_releases() {
         let mut child = std::process::Command::new("ping")
@@ -689,6 +691,7 @@ mod tests {
         assert_eq!(cpu_names(&two), "CPUs 14, 15");
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_program_exempted_while_engaged_gets_every_core_back_at_once() {
         let mut child = std::process::Command::new("ping")
@@ -1084,6 +1087,7 @@ cores = 1"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_pin_confines_a_real_process_and_lets_it_go() {
         let mut child = std::process::Command::new("ping")

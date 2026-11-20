@@ -44,7 +44,6 @@ raw-window-handle = "0.6.2"
 serde.workspace = true
 serde_json.workspace = true
 tray-icon.workspace = true
-winreg.workspace = true
 
 [build-dependencies]
 winresource.workspace = true
@@ -56,3 +55,10 @@ workspace = true
 egui_kittest = { version = "0.37.0", features = ["eframe"] }
 # GPU reviews use the same on-demand Windows font fallback as the app.
 egui_system_font_provider = "0.37.0"
+
+[target.'cfg(windows)'.dependencies]
+winreg.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The tray icon lives on a GTK thread of its own (tray-icon needs GTK there).
+gtk = "0.18"

@@ -103,6 +103,13 @@ impl PowerApi for WindowsPower {
     }
 }
 fn directory() -> Result<PathBuf, String> {
+    #[cfg(target_os = "linux")]
+    {
+        // Frequency caps are reset by a reboot on Linux; the journal of what
+        // to restore lives as long.
+        Ok(PathBuf::from("/run/rustwtm/PowerLimits"))
+    }
+    #[cfg(windows)]
     Ok(
         PathBuf::from(std::env::var_os("ProgramData").ok_or("ProgramData is unavailable")?)
             .join("RustWTM/PowerLimits"),

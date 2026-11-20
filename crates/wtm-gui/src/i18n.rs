@@ -250,6 +250,7 @@ impl Language {
     }
 }
 
+#[cfg(windows)]
 const REGISTRY: &str = r"Software\RustWTM";
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
 thread_local! { static LOCAL: Cell<Option<u8>> = const { Cell::new(None) }; }
@@ -291,12 +292,43 @@ fn locale_catalog(index: usize) -> Option<&'static LocaleCatalog> {
 fn system_language() -> Language {
     Language::from_tag(&wtm_core::system_ui_language())
 }
+/// `~/.config/rustwtm/language`: the chosen language as JSON.
+#[cfg(target_os = "linux")]
+fn preference_file() -> Option<std::path::PathBuf> {
+    wtm_sys::compat::user_config_dir().map(|d| d.join("language"))
+}
+
+#[cfg(target_os = "linux")]
+pub fn preference() -> Language {
+    preference_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(s.trim()).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+pub fn save(language: Language) -> std::io::Result<()> {
+    let path =
+        preference_file().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_string(&language).expect("language serialization"),
+    )?;
+    activate(language);
+    Ok(())
+}
+
+#[cfg(windows)]
 pub fn preference() -> Language {
     let key = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
         .open_subkey(REGISTRY)
         .ok();
     read_preference(key.as_ref())
 }
+#[cfg(windows)]
 fn read_preference(key: Option<&winreg::RegKey>) -> Language {
     key.and_then(|k| k.get_value::<String, _>("Language").ok())
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -308,6 +340,7 @@ pub fn initialize() {
 pub fn activate(language: Language) {
     ACTIVE.store(language.index(), Ordering::Relaxed);
 }
+#[cfg(windows)]
 pub fn save(language: Language) -> std::io::Result<()> {
     let (key, _) =
         winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER).create_subkey(REGISTRY)?;
@@ -315,6 +348,7 @@ pub fn save(language: Language) -> std::io::Result<()> {
     activate(language);
     Ok(())
 }
+#[cfg(windows)]
 fn write_preference(key: &winreg::RegKey, language: Language) -> std::io::Result<()> {
     key.set_value(
         "Language",
@@ -1020,6 +1054,7 @@ mod tests {
             assert_eq!(Language::from_tag(tag), language);
         }
     }
+    #[cfg(windows)]
     #[test]
     fn persisted_language_round_trips_and_invalid_preferences_use_windows() {
         use winreg::{RegKey, enums::HKEY_CURRENT_USER};

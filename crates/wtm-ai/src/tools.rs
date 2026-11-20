@@ -904,9 +904,15 @@ pub fn process_tree(t: &ProcessRef, procs: &[ProcessInfo]) -> String {
 fn process_modules(t: &ProcessRef) -> Result<String, String> {
     const CHECKED: usize = 40;
     let modules = wtm_core::process_modules(t.pid, t.create_time).map_err(|e| e.to_string())?;
-    let windir = std::env::var("SystemRoot")
-        .unwrap_or_else(|_| r"C:\Windows".into())
-        .to_lowercase();
+    // The operating system's own files: those of Windows, or of /usr/lib
+    // (distribution packages) on Linux.
+    let windir = if cfg!(windows) {
+        std::env::var("SystemRoot")
+            .unwrap_or_else(|_| r"C:\Windows".into())
+            .to_lowercase()
+    } else {
+        "/usr/lib/".to_owned()
+    };
     let mut out = format!("{} modules in {} (PID {})\n", modules.len(), t.name, t.pid);
     let mut checked = 0;
     let mut windows = 0;
@@ -1194,6 +1200,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn modules_services_and_startup_answer() {
         let mut tools = Toolbox::new(false);

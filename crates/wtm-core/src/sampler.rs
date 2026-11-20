@@ -397,6 +397,31 @@ fn system_cpu_percent(prev: CpuTimes, now: CpuTimes) -> f32 {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_watcher_reports_a_new_linux_process_once() {
+        let mut w = StartWatcher::new();
+        assert!(w.poll().unwrap().is_empty(), "first poll only primes");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = 0;
+        while Instant::now() < deadline && found == 0 {
+            found += w.poll().unwrap().iter().filter(|p| p.pid == pid).count();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(found, 1);
+        assert!(
+            w.poll().unwrap().iter().all(|p| p.pid != pid),
+            "reported once"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn network_traffic_is_taken_per_adapter() {
         let c = |received, sent| NetCounters { received, sent };
@@ -467,6 +492,7 @@ mod tests {
         assert_eq!(system_cpu_percent(a, a), 0.0);
     }
 
+    #[cfg(windows)]
     #[test]
     fn start_watcher_reports_new_processes_once() {
         let mut w = StartWatcher::new();

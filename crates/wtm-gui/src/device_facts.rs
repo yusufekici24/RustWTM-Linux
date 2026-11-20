@@ -253,6 +253,34 @@ pub struct Collector {
 
 /// Drives in Windows' list of page files in use
 /// (`\??\C:\pagefile.sys` entries of `ExistingPageFiles`).
+#[cfg(target_os = "linux")]
+fn page_file_drives() -> Vec<String> {
+    // Swap files and partitions in use, as the mount points that hold
+    // them (a swap partition is on no mounted filesystem: its device).
+    let swaps = std::fs::read_to_string("/proc/swaps").unwrap_or_default();
+    let mut points: Vec<String> = Vec::new();
+    let mounts: Vec<String> = wtm_core::volumes().into_iter().map(|v| v.root).collect();
+    for line in swaps.lines().skip(1) {
+        let Some(file) = line.split_whitespace().next() else {
+            continue;
+        };
+        let point = mounts
+            .iter()
+            .filter(|m| {
+                file.starts_with(m.as_str())
+                    && (m.as_str() == "/" || file[m.len()..].starts_with('/'))
+            })
+            .max_by_key(|m| m.len())
+            .cloned()
+            .unwrap_or_else(|| file.to_owned());
+        if !points.contains(&point) {
+            points.push(point);
+        }
+    }
+    points
+}
+
+#[cfg(windows)]
 fn page_file_drives() -> Vec<String> {
     use winreg::RegKey;
     use winreg::enums::HKEY_LOCAL_MACHINE;
@@ -263,6 +291,7 @@ fn page_file_drives() -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn drives_of(files: &[String]) -> Vec<String> {
     let mut drives: Vec<String> = files
         .iter()

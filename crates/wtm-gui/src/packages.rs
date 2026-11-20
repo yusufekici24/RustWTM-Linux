@@ -251,6 +251,7 @@ impl View {
 }
 #[cfg(test)]
 impl View {
+    #[cfg_attr(not(windows), allow(unused_imports, dead_code))]
     pub fn fixture(review: bool) -> Self {
         let package = wtm_core::packages::Package {
             id: "Example.Editor".into(),
@@ -282,9 +283,11 @@ impl View {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable;
+    #[cfg(windows)]
     #[test]
     fn cancelling_package_review_never_starts_an_update() {
         let mut v = View {

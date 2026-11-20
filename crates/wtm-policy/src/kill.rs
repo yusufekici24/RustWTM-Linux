@@ -612,6 +612,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_documented_examples_are_valid() {
         // The commented [[kill]] blocks of the default configuration.

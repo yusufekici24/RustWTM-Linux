@@ -237,6 +237,7 @@ mod tests {
         assert_eq!(unchanged.tick(secs(t, 3), 99.0), Some(RescueStep::Engage));
     }
 
+    #[cfg(windows)]
     #[test]
     fn confines_ordinary_programs_only() {
         let cfg = ReserveConfig {

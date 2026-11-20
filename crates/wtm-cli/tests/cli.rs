@@ -1,5 +1,6 @@
 //! Runs the real `wtm` binary against short-lived child processes.
 
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ impl Drop for Guard {
     }
 }
 
+#[cfg(windows)]
 fn spawn_ping() -> Guard {
     let child = Guard(
         Command::new("cmd.exe")
@@ -59,6 +61,7 @@ fn list_prints_summary_header_and_rows() {
     assert_eq!(lines.len(), 8, "{out}");
 }
 
+#[cfg(windows)]
 #[test]
 fn list_info_and_ports_print_json() {
     let o = wtm(&["list", "--sample-ms", "100", "-n", "3", "--json"]);
@@ -80,6 +83,7 @@ fn list_info_and_ports_print_json() {
     assert!(ports.is_array());
 }
 
+#[cfg(windows)]
 #[test]
 fn list_shows_command_lines() {
     let o = wtm(&["list", "--sample-ms", "100", "--sort", "pid", "--cmdline"]);
@@ -98,6 +102,7 @@ fn list_shows_command_lines() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn info_shows_details() {
     let child = spawn_ping();
@@ -110,6 +115,7 @@ fn info_shows_details() {
     assert!(out.contains("Protected    no"));
 }
 
+#[cfg(windows)]
 #[test]
 fn control_commands_round_trip() {
     let child = spawn_ping();
@@ -137,6 +143,7 @@ fn control_commands_round_trip() {
     assert!(info.contains("EcoQoS       SystemManaged"), "{info}");
 }
 
+#[cfg(windows)]
 #[test]
 fn kill_tree_terminates_the_child() {
     let mut child = spawn_ping();
@@ -151,6 +158,7 @@ fn kill_tree_terminates_the_child() {
     }
 }
 
+#[cfg(windows)]
 #[test]
 fn refusals_and_errors_fail_with_messages() {
     // Protected processes are refused.
@@ -190,6 +198,7 @@ fn refusals_and_errors_fail_with_messages() {
     assert!(stderr(&o).contains("--cpu and/or --memory"));
 }
 
+#[cfg(windows)]
 #[test]
 fn top_and_history_fail_gracefully_without_terminal_or_service() {
     // Detached from any console, the TUI cannot enter raw mode and must
@@ -225,6 +234,7 @@ fn top_and_history_fail_gracefully_without_terminal_or_service() {
     }
 }
 
+#[cfg(windows)]
 #[test]
 fn limit_holds_until_the_process_exits() {
     let child = spawn_ping();

@@ -35,12 +35,21 @@ impl Default for GameModeConfig {
             background_cpu_percent: 2.0,
             actions: vec![Action::Priority(PriorityLevel::BelowNormal), Action::EcoQos],
             power_plan: false,
-            exempt: vec![
-                "obs*.exe".into(),
-                "discord.exe".into(),
-                "audiodg.exe".into(),
-                "explorer.exe".into(),
-            ],
+            exempt: if cfg!(windows) {
+                vec![
+                    "obs*.exe".into(),
+                    "discord.exe".into(),
+                    "audiodg.exe".into(),
+                    "explorer.exe".into(),
+                ]
+            } else {
+                vec![
+                    "obs*".into(),
+                    "Discord".into(),
+                    "pipewire*".into(),
+                    "gnome-shell".into(),
+                ]
+            },
         }
     }
 }
@@ -225,6 +234,7 @@ mod tests {
         ))
     }
 
+    #[cfg(windows)]
     #[test]
     fn calms_busy_background_apps_while_a_game_runs_and_restores_after() {
         let procs = [

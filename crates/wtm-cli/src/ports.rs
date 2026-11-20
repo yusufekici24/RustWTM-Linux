@@ -243,6 +243,7 @@ mod tests {
         assert_eq!(json(&[], &[], true, false), serde_json::json!([]));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_port_is_freed_only_with_yes() {
         let mut ended = Vec::new();

@@ -1,10 +1,13 @@
 //! One bounded, read-only CIM inventory per window; never on the UI thread.
 use eframe::egui::{self, Ui};
+#[cfg(windows)]
 use std::io::Read;
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
 const MAX_REPLY: usize = 512 * 1024;
+#[cfg_attr(not(windows), allow(dead_code))]
 const SCRIPT: &str = r#"
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $ErrorActionPreference = 'Stop'
@@ -44,6 +47,7 @@ pub(crate) struct Item {
 type Inventory = Result<Vec<Item>, String>;
 type Shared = Arc<Mutex<Option<Inventory>>>;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Item>, String> {
     if bytes.len() >= MAX_REPLY {
         return Err("Inventory response exceeds its limit".into());
@@ -59,6 +63,125 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Vec<Item>, String> {
     Ok(items)
 }
 
+/// The same inventory from sysfs (DMI, /proc/cpuinfo, block devices, DRM
+/// cards) and the SMBIOS memory devices.
+#[cfg(target_os = "linux")]
+fn collect() -> Inventory {
+    let read = |p: &str| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    };
+    let dmi = |f: &str| read(&format!("/sys/class/dmi/id/{f}"));
+    let mut items = Vec::new();
+    let mut push = |kind: &str, fields: Vec<(&str, Option<String>)>| {
+        let fields: Vec<String> = fields
+            .into_iter()
+            .filter_map(|(k, v)| Some(format!("{k}: {}", v?)))
+            .collect();
+        items.push(Item {
+            kind: kind.into(),
+            fields,
+        });
+    };
+    push(
+        "System",
+        vec![
+            ("Manufacturer", dmi("sys_vendor")),
+            ("Model", dmi("product_name")),
+            ("SystemType", Some(std::env::consts::ARCH.into())),
+        ],
+    );
+    push(
+        "BIOS",
+        vec![
+            ("Manufacturer", dmi("bios_vendor")),
+            ("SMBIOSBIOSVersion", dmi("bios_version")),
+            ("ReleaseDate", dmi("bios_date")),
+        ],
+    );
+    let cpu = wtm_sys::cpu_info::info();
+    push(
+        "CPU",
+        vec![
+            ("Name", cpu.name.clone()),
+            ("NumberOfCores", Some(cpu.layout.cores.to_string())),
+            (
+                "NumberOfLogicalProcessors",
+                Some(cpu.layout.logical.to_string()),
+            ),
+            (
+                "MaxClockSpeed",
+                read("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+                    .and_then(|k| k.parse::<u64>().ok())
+                    .map(|k| (k / 1000).to_string()),
+            ),
+            ("L2CacheSize", Some((cpu.layout.l2 / 1024).to_string())),
+            ("L3CacheSize", Some((cpu.layout.l3 / 1024).to_string())),
+        ],
+    );
+    push(
+        "Motherboard",
+        vec![
+            ("Manufacturer", dmi("board_vendor")),
+            ("Product", dmi("board_name")),
+            ("Version", dmi("board_version")),
+        ],
+    );
+    for m in wtm_sys::smbios::memory_modules()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| m.size > 0)
+        .take(64)
+    {
+        push(
+            "RAM",
+            vec![
+                ("Manufacturer", Some(m.manufacturer.clone())),
+                ("PartNumber", Some(m.part_number.clone())),
+                ("Capacity", Some(m.size.to_string())),
+                (
+                    "ConfiguredClockSpeed",
+                    m.configured_speed.map(|s| s.to_string()),
+                ),
+                ("DeviceLocator", Some(m.locator.clone())),
+                ("SMBIOSMemoryType", Some(m.memory_type.to_string())),
+                ("FormFactor", Some(m.form_factor.to_string())),
+            ],
+        );
+    }
+    for n in 0..64 {
+        let Ok(d) = wtm_sys::physical_disk::read(n) else {
+            break;
+        };
+        push(
+            "Disk",
+            vec![
+                ("Index", Some(n.to_string())),
+                ("Model", Some(d.model.clone())),
+                ("Size", d.size.map(|s| s.to_string())),
+                ("InterfaceType", d.bus_name().map(str::to_owned)),
+            ],
+        );
+    }
+    for a in wtm_sys::gpu::adapters().unwrap_or_default() {
+        push(
+            "GPU",
+            vec![
+                ("Name", Some(a.name.clone())),
+                (
+                    "AdapterCompatibility",
+                    Some(format!("{:04x}:{:04x}", a.vendor_id, a.device_id)),
+                ),
+            ],
+        );
+    }
+    let _ = MAX_REPLY;
+    Ok(items)
+}
+
+#[cfg(windows)]
 fn collect() -> Inventory {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};

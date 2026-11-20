@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=RustWTM
+GenericName=Task Manager
+GenericName[tr]=Görev Yöneticisi
+Comment=Monitor processes, manage resource usage and keep the PC responsive
+Comment[tr]=Süreçleri izleyin, kaynak kullanımını yönetin ve bilgisayarı yanıt verir tutun
+Exec=/usr/bin/rustwtm
+Icon=rustwtm
+Terminal=false
+Categories=System;Monitor;GTK;
+Keywords=task;manager;process;monitor;cpu;memory;kill;görev;süreç;
+StartupWMClass=rustwtm

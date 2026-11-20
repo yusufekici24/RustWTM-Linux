@@ -7,6 +7,7 @@ use eframe::egui::{self, ViewportCommand};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+#[cfg(windows)]
 pub struct Tray {
     menu: Menu,
     numbers: [Option<NumberIcon>; 3],
@@ -24,6 +25,7 @@ pub struct Tray {
     /// CPU load shown by the icon, in steps of 10%.
     load_step: Option<u8>,
 }
+#[cfg(windows)]
 struct NumberIcon {
     icon: TrayIcon,
     reading: crate::numeric_tray::Reading,
@@ -131,6 +133,7 @@ fn on_icon(event: &TrayIconEvent, ctx: &egui::Context, window: &AtomicIsize) {
     }
 }
 
+#[cfg(windows)]
 impl Tray {
     /// Returns `None` if the shell refuses the icon; the app works without it.
     pub fn new(
@@ -335,6 +338,245 @@ impl Tray {
         self.show.set_text(labels[0]);
         self.notify.set_text(labels[1]);
         self.exit.set_text(labels[2]);
+        self.labels = labels;
+        self.numbers_updated = None;
+    }
+}
+
+/// Linux: GTK objects belong to the thread that runs GTK, so the icons and
+/// the menu live on a thread of their own running `gtk::main`; the window
+/// sends it what to show. Menu and icon events reach egui from there (the
+/// egui context is thread-safe). The icons appear through the
+/// StatusNotifier/AppIndicator protocol (Ubuntu's AppIndicator extension).
+#[cfg(target_os = "linux")]
+pub struct Tray {
+    tx: std::sync::mpsc::Sender<Cmd>,
+    tooltip: String,
+    load_step: Option<u8>,
+    labels: [&'static str; 3],
+    number_prefs: Option<crate::numeric_tray::Preferences>,
+    numbers_updated: Option<std::time::Instant>,
+    numbers: [Option<crate::numeric_tray::Reading>; 3],
+}
+
+#[cfg(target_os = "linux")]
+enum Cmd {
+    Icon(Vec<u8>),
+    Tooltip(String),
+    Labels([String; 3]),
+    Number(usize, Option<(Vec<u8>, String)>),
+    LogoVisible(bool),
+}
+
+#[cfg(target_os = "linux")]
+impl Tray {
+    pub fn new(
+        ctx: &egui::Context,
+        notifications: Arc<AtomicBool>,
+        window: Arc<AtomicIsize>,
+    ) -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        let ctx = ctx.clone();
+        let labels = [
+            crate::i18n::tr("Show RustWTM"),
+            crate::i18n::tr("Notifications"),
+            crate::i18n::tr("Exit"),
+        ];
+        let start = notifications.load(Ordering::Relaxed);
+        std::thread::Builder::new()
+            .name("tray-gtk".into())
+            .spawn(move || {
+                if gtk::init().is_err() {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+                let show = MenuItem::new(labels[0], true, None);
+                let notify = CheckMenuItem::new(labels[1], true, start, None);
+                let exit = MenuItem::new(labels[2], true, None);
+                let menu = Menu::new();
+                if menu
+                    .append_items(&[&show, &notify, &PredefinedMenuItem::separator(), &exit])
+                    .is_err()
+                {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+                let items = [show.id().clone(), notify.id().clone(), exit.id().clone()];
+                let (menu_ctx, menu_window) = (ctx.clone(), window.clone());
+                MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                    on_menu(&event.id, &items, &menu_ctx, &notifications, &menu_window);
+                }));
+                let click_ctx = ctx.clone();
+                TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+                    on_icon(&event, &click_ctx, &window);
+                }));
+                let Some(logo) = icon() else {
+                    let _ = ready_tx.send(false);
+                    return;
+                };
+                let Ok(main) = TrayIconBuilder::new()
+                    .with_id("rustwtm")
+                    .with_menu(Box::new(menu.clone()))
+                    .with_tooltip("RustWTM")
+                    .with_icon(logo)
+                    .build()
+                else {
+                    let _ = ready_tx.send(false);
+                    return;
+                };
+                let _ = ready_tx.send(true);
+                let mut numbers: [Option<TrayIcon>; 3] = [None, None, None];
+                gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Cmd::Icon(rgba)) => {
+                                if let Ok(i) = Icon::from_rgba(rgba, SIZE, SIZE) {
+                                    let _ = main.set_icon(Some(i));
+                                }
+                            }
+                            Ok(Cmd::Tooltip(t)) => {
+                                let _ = main.set_tooltip(Some(&t));
+                            }
+                            Ok(Cmd::Labels([a, b, c])) => {
+                                show.set_text(a);
+                                notify.set_text(b);
+                                exit.set_text(c);
+                            }
+                            Ok(Cmd::Number(kind, None)) => numbers[kind] = None,
+                            Ok(Cmd::Number(kind, Some((rgba, tip)))) => {
+                                let Ok(i) = Icon::from_rgba(rgba, 32, 32) else {
+                                    continue;
+                                };
+                                match &numbers[kind] {
+                                    Some(n) => {
+                                        let _ = n.set_icon(Some(i));
+                                        let _ = n.set_tooltip(Some(&tip));
+                                    }
+                                    None => {
+                                        numbers[kind] = TrayIconBuilder::new()
+                                            .with_id(format!("rustwtm-number-{kind}"))
+                                            .with_menu(Box::new(menu.clone()))
+                                            .with_tooltip(&tip)
+                                            .with_icon(i)
+                                            .build()
+                                            .ok();
+                                    }
+                                }
+                            }
+                            Ok(Cmd::LogoVisible(v)) => {
+                                let _ = main.set_visible(v);
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                return gtk::glib::ControlFlow::Continue;
+                            }
+                            // The window is gone: stop GTK and the thread.
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                gtk::main_quit();
+                                return gtk::glib::ControlFlow::Break;
+                            }
+                        }
+                    }
+                });
+                gtk::main();
+            })
+            .ok()?;
+        if !ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        Some(Self {
+            tx,
+            tooltip: "RustWTM".into(),
+            load_step: None,
+            labels,
+            number_prefs: None,
+            numbers_updated: None,
+            numbers: std::array::from_fn(|_| None),
+        })
+    }
+
+    pub fn set_numbers(
+        &mut self,
+        ctx: &egui::Context,
+        prefs: &crate::numeric_tray::Preferences,
+        readings: [crate::numeric_tray::Reading; 3],
+    ) {
+        let now = std::time::Instant::now();
+        let changed = self.number_prefs.as_ref() != Some(prefs);
+        let availability_changed = self.numbers.iter().zip(&readings).any(|(shown, reading)| {
+            shown
+                .as_ref()
+                .is_some_and(|s| s.value.is_some() != reading.value.is_some())
+        });
+        if !crate::numeric_tray::refresh_due(
+            self.numbers_updated,
+            changed,
+            availability_changed,
+            prefs.interval(),
+            now,
+        ) {
+            return;
+        }
+        self.number_prefs = Some(prefs.clone());
+        self.numbers_updated = Some(now);
+        for (kind, (enabled, reading)) in prefs.enabled().into_iter().zip(readings).enumerate() {
+            if !enabled {
+                if self.numbers[kind].take().is_some() {
+                    let _ = self.tx.send(Cmd::Number(kind, None));
+                }
+                continue;
+            }
+            if self.numbers[kind].as_ref() != Some(&reading) {
+                let rgba = crate::numeric_tray::rgba(kind, reading.value);
+                let _ = self
+                    .tx
+                    .send(Cmd::Number(kind, Some((rgba, reading.tooltip.clone()))));
+                self.numbers[kind] = Some(reading);
+            }
+        }
+        let visible = prefs.show_logo || self.numbers.iter().all(Option::is_none);
+        let _ = self.tx.send(Cmd::LogoVisible(visible));
+        ctx.data_mut(|d| d.remove::<String>(egui::Id::unique("numeric-tray-error")));
+    }
+
+    pub fn set_load(&mut self, cpu_percent: f32) {
+        let step = (cpu_percent / 10.0).round().clamp(0.0, 10.0) as u8;
+        if self.load_step != Some(step) {
+            let _ = self.tx.send(Cmd::Icon(load_rgba(step)));
+            self.load_step = Some(step);
+        }
+    }
+
+    pub fn clear_load(&mut self) {
+        if self.load_step.take().is_some() {
+            let _ = self.tx.send(Cmd::Icon(crate::logo::rgba(SIZE)));
+        }
+    }
+
+    pub fn temperature_active(&self) -> bool {
+        self.numbers[2].is_some()
+    }
+
+    pub fn set_tooltip(&mut self, text: String) {
+        if text != self.tooltip {
+            let _ = self.tx.send(Cmd::Tooltip(text.clone()));
+            self.tooltip = text;
+        }
+    }
+
+    pub fn localize(&mut self) {
+        let labels = [
+            crate::i18n::tr("Show RustWTM"),
+            crate::i18n::tr("Notifications"),
+            crate::i18n::tr("Exit"),
+        ];
+        if self.labels == labels {
+            return;
+        }
+        let _ = self.tx.send(Cmd::Labels(labels.map(str::to_owned)));
         self.labels = labels;
         self.numbers_updated = None;
     }

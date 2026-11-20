@@ -1617,7 +1617,7 @@ fn protection(ui: &mut Ui, data: &Data, commands: &mut Vec<UiCommand>) {
             ui.label(crate::i18n::tr(
                 "Install and start it from an elevated prompt:",
             ));
-            ui.code("wtm-service install\nwtm-service start");
+            ui.code(crate::app::SERVICE_START_COMMANDS);
         }
         return;
     }

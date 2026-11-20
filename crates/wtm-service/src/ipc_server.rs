@@ -1104,6 +1104,7 @@ mod tests {
         assert!(error(set_telegram(&shared, &cfg)).contains("Telegram control is disabled"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn foreground_reports_are_limited_to_the_clients_session() {
         let shared = Shared::default();

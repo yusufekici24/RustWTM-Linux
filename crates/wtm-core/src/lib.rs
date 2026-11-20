@@ -8,21 +8,29 @@ pub mod diskscan;
 pub mod docker;
 pub mod find;
 pub use wtm_sys::cpu;
+#[cfg_attr(target_os = "linux", path = "linux/gui_startup.rs")]
 pub mod gui_startup;
 pub mod hardware;
 pub mod incidents;
+#[cfg_attr(target_os = "linux", path = "linux/installed.rs")]
 pub mod installed;
 pub mod launch;
+#[cfg(target_os = "linux")]
+#[path = "linux/devices_probe.rs"]
+mod linux_devices;
 mod model;
 pub mod packages;
 pub mod ports;
 pub mod power;
+#[cfg(windows)]
 mod probe;
 pub mod project;
 mod protection;
 mod sampler;
+#[cfg_attr(target_os = "linux", path = "linux/startup.rs")]
 pub mod startup;
 pub mod startup_impact;
+#[cfg_attr(target_os = "linux", path = "linux/task_manager.rs")]
 pub mod task_manager;
 mod tree;
 pub mod update;
