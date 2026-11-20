@@ -14,7 +14,9 @@ wtm-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-winreg.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg.workspace = true

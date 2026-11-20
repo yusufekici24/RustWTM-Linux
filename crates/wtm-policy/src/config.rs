@@ -13,7 +13,11 @@ use crate::rules::Rule;
 use crate::swarm::SwarmConfig;
 
 /// Written to disk on first start; parses to `Config::default()`.
+#[cfg(windows)]
 pub const DEFAULT_CONFIG_TOML: &str = include_str!("default_config.toml");
+/// The same template with Linux program names and paths.
+#[cfg(not(windows))]
+pub const DEFAULT_CONFIG_TOML: &str = include_str!("default_config.linux.toml");
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -120,7 +124,11 @@ impl Default for GovernorConfig {
                 Action::CpuCapRelative(0.5),
                 Action::CpuCapRelative(0.25),
             ],
-            exempt: vec!["explorer.exe".into(), "Taskmgr.exe".into()],
+            exempt: if cfg!(windows) {
+                vec!["explorer.exe".into(), "Taskmgr.exe".into()]
+            } else {
+                vec!["gnome-shell".into(), "rustwtm".into()]
+            },
             protect_foreground: true,
         }
     }
@@ -261,6 +269,59 @@ pub fn set_config_value(
     Ok(doc.to_string())
 }
 
+/// Linux: a plain program name (no `.exe`), never one the machine needs to
+/// let anyone sign in, elevate or recover.
+#[cfg(not(windows))]
+fn validate_block(name: &str) -> Result<(), String> {
+    if name.contains(['\\', '/', '*', '?', '"']) || name.trim() != name || name.is_empty() {
+        return Err("must be a plain program name like xmrig (no path or wildcards)".into());
+    }
+    if name.len() > 255 {
+        return Err("must be at most 255 characters".into());
+    }
+    const NEVER: [&str; 33] = [
+        "systemd",
+        "init",
+        "sh",
+        "bash",
+        "dash",
+        "zsh",
+        "sudo",
+        "su",
+        "pkexec",
+        "login",
+        "sshd",
+        "agetty",
+        "gdm3",
+        "gdm-session-worker",
+        "gnome-shell",
+        "gnome-session-binary",
+        "Xorg",
+        "Xwayland",
+        "dbus-daemon",
+        "dbus-broker",
+        "polkitd",
+        "systemctl",
+        "apt",
+        "apt-get",
+        "dpkg",
+        "env",
+        "rustwtm",
+        "wtm",
+        "wtm-service",
+        "runuser",
+        "busctl",
+        "nft",
+        "ld-linux-x86-64.so.2",
+    ];
+    let bare = name.strip_suffix(".exe").unwrap_or(name);
+    if NEVER.contains(&bare) || wtm_core::protection_reason(u32::MAX, bare).is_some() {
+        return Err("this program cannot be blocked".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn validate_block(name: &str) -> Result<(), String> {
     if name.contains(['\\', '/', '*', '?', '"']) || name.trim() != name {
         return Err("must be a plain file name like pp.exe (no path or wildcards)".into());
@@ -327,6 +388,31 @@ mod tests {
         assert!(set_config_value("not toml [", "", "x", 1i64).is_err());
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_block_names_are_plain_unprotected_programs() {
+        let config = |name: &str| Config {
+            block: vec![name.into()],
+            ..Config::default()
+        };
+        assert!(config("xmrig").validate().is_ok());
+        assert!(config("xmrig.exe").validate().is_ok());
+        for bad in [
+            "/usr/bin/x",
+            "x*",
+            "",
+            " x",
+            "bash",
+            "gnome-shell",
+            "wtm-service",
+            "systemd",
+        ] {
+            assert!(config(bad).validate().is_err(), "{bad}");
+        }
+        DEFAULT_CONFIG_TOML.parse::<toml::Table>().unwrap();
+    }
+
+    #[cfg(windows)]
     #[test]
     fn block_names_must_be_plain_unprotected_executables() {
         let config = |name: &str| Config {

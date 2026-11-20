@@ -435,6 +435,7 @@ mod tests {
         assert!(e.tick(at(20), &procs(20.0), &mut no_path).is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn unconditional_rule_and_memory_condition() {
         let mut e = RuleEngine::new(vec![

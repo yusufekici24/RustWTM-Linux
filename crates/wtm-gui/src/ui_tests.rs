@@ -1772,6 +1772,7 @@ fn rate_plot_labels_show_bytes_per_second() {
     assert!(crate::app::rate_label(&HoverPosition::Elsewhere { position }).is_none());
 }
 
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 struct PickState {
     data: Data,
     filter: String,
@@ -1781,6 +1782,7 @@ struct PickState {
     commands: Vec<String>,
 }
 
+#[cfg(windows)]
 #[test]
 fn services_and_startup_views_select_and_toggle() {
     let mut h = Harness::builder()

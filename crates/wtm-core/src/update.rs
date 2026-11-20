@@ -90,7 +90,7 @@ pub fn parse_release(json: &[u8]) -> Result<Release, String> {
     let msi = r
         .assets
         .iter()
-        .find(|a| a.name.to_ascii_lowercase().ends_with(".msi"))
+        .find(|a| a.name.to_ascii_lowercase().ends_with(INSTALLER_SUFFIX))
         .and_then(|a| {
             Some((
                 a.browser_download_url.clone(),
@@ -106,6 +106,13 @@ pub fn parse_release(json: &[u8]) -> Result<Release, String> {
 }
 
 const USER_AGENT: &str = concat!("RustWTM/", env!("CARGO_PKG_VERSION"));
+
+/// The release asset this platform installs: the MSI on Windows, the
+/// Debian package on Linux.
+#[cfg(windows)]
+const INSTALLER_SUFFIX: &str = ".msi";
+#[cfg(target_os = "linux")]
+const INSTALLER_SUFFIX: &str = "_amd64.deb";
 
 fn fetch(url: &str) -> Result<Vec<u8>, String> {
     match wtm_sys::http::get(url, USER_AGENT) {
@@ -189,6 +196,17 @@ pub fn download(release: &Release, dir: &Path) -> Result<Download, String> {
 
 /// Whether `exe` runs from the folder the MSI installed RustWTM into (only
 /// then can an installer update it).
+#[cfg(target_os = "linux")]
+pub fn installed_by_msi(exe: &Path) -> bool {
+    // Installed by the rustwtm package, in /usr/bin.
+    exe.parent() == Some(Path::new("/usr/bin"))
+        && std::process::Command::new("dpkg-query")
+            .args(["-W", "-f=${Status}", "rustwtm"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("install ok installed"))
+}
+
+#[cfg(windows)]
 pub fn installed_by_msi(exe: &Path) -> bool {
     use winreg::RegKey;
     use winreg::enums::HKEY_LOCAL_MACHINE;
@@ -199,6 +217,7 @@ pub fn installed_by_msi(exe: &Path) -> bool {
     dir.is_some_and(|d| same_dir(Path::new(&d), exe))
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn same_dir(install_dir: &Path, exe: &Path) -> bool {
     let norm = |p: &Path| p.to_string_lossy().trim_end_matches('\\').to_lowercase();
     exe.parent().is_some_and(|p| norm(p) == norm(install_dir))
@@ -367,6 +386,39 @@ pub fn take_outcome(dir: &Path) -> Option<(Version, Outcome)> {
 /// checks the copy against the hash, and the publisher, again and installs
 /// that. What became of it is written beside the download for the RustWTM
 /// started afterwards ([`take_outcome`]).
+#[cfg(target_os = "linux")]
+pub fn install(deb: &Download, relaunch: &Path, version: Version) -> Result<(), String> {
+    let dir = deb.path.parent().unwrap_or(Path::new("."));
+    let outcome = dir.join(OUTCOME_FILE);
+    let _ = std::fs::remove_file(&outcome);
+    let hash: String = deb.sha256.iter().map(|b| format!("{b:02x}")).collect();
+    let (a, b, c) = version;
+    // The download sits where the user can write: the elevated step copies
+    // it to a root-only place, checks the copy against the hash and installs
+    // that copy. polkit asks for the password; 126 means it was dismissed.
+    let elevated = "t=$(mktemp -d /root/.rustwtm-update.XXXXXX) || exit 92; cp -- \"$1\" \"$t/rustwtm.deb\" || exit 92; \
+         echo \"$2  $t/rustwtm.deb\" | sha256sum -c --status || { rm -rf \"$t\"; exit 91; }; \
+         apt-get install -y --allow-downgrades \"$t/rustwtm.deb\"; rc=$?; rm -rf \"$t\"; exit $rc";
+    let script = format!(
+        "pkexec /bin/sh -c '{elevated}' sh \"$1\" \"$2\"; rc=$?; \
+         case $rc in 0) r='exit 0';; 126|127) r='cancelled';; 91) r='exit {CHECKSUM_CHANGED}';; *) r=\"exit $rc\";; esac; \
+         echo \"{a}.{b}.{c} $r\" > \"$3\" 2>/dev/null; exec \"$4\""
+    );
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .arg("sh")
+        .arg(&deb.path)
+        .arg(hash)
+        .arg(&outcome)
+        .arg(relaunch)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(windows)]
 pub fn install(msi: &Download, relaunch: &Path, version: Version) -> Result<(), String> {
     let pin = publisher_policy(&publisher(relaunch), &publisher(&msi.path))?;
     let dir = msi.path.parent().unwrap_or(Path::new("."));
@@ -388,6 +440,7 @@ pub fn install(msi: &Download, relaunch: &Path, version: Version) -> Result<(), 
 /// its process once it has ended. Process.Start, not Start-Process: only it
 /// keeps the Windows error (1223 when the prompt is declined) inside the
 /// exception it throws.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn elevate(script: &str) -> String {
     format!(
         "& {{ $i = New-Object Diagnostics.ProcessStartInfo 'powershell.exe'; \
@@ -402,6 +455,7 @@ fn elevate(script: &str) -> String {
 /// process, then writes what became of it to `outcome` and runs `relaunch`,
 /// also when elevation is declined or fails, and also when the outcome
 /// cannot be written.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn launcher(elevate: &str, outcome: &Path, version: Version, relaunch: &str) -> String {
     let (a, b, c) = version;
     format!(
@@ -425,6 +479,7 @@ fn launcher(elevate: &str, outcome: &Path, version: Version, relaunch: &str) -> 
 /// embedded signature whose certificate has the same whole subject as the
 /// valid signature of `own`, the running RustWTM. Both are read the same
 /// way, so their text can be compared as it is.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn publisher_check(own: &Path) -> String {
     // Neither certificate is read unless both signatures hold: under
     // 'Stop' a missing one would throw and exit 1 for the wrong reason.
@@ -445,6 +500,7 @@ fn publisher_check(own: &Path) -> String {
 /// that only SYSTEM and administrators can reach, checks it (and, with
 /// `own`, that the copy is signed by the publisher of that file, the
 /// running RustWTM) and installs it.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn elevated_install(msi: &Download, own: Option<&Path>) -> String {
     let hash: String = msi.sha256.iter().map(|b| format!("{b:02X}")).collect();
     let signed = own.map_or_else(String::new, publisher_check);
@@ -470,6 +526,7 @@ fn elevated_install(msi: &Download, own: Option<&Path>) -> String {
 
 /// `text` as a single-quoted PowerShell string. PowerShell ends one at any
 /// of ' ‘ ’ ‚ ‛ (as in C:\Users\O’Brien), so each is doubled.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn ps_quote(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('\'');
@@ -484,6 +541,7 @@ pub(crate) fn ps_quote(text: &str) -> String {
 }
 
 /// A script for `powershell -EncodedCommand`: base64 of its UTF-16LE.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn encode_command(script: &str) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -507,9 +565,34 @@ pub(crate) fn encode_command(script: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_picks_the_debian_package_and_its_checksum() {
+        let json = serde_json::json!({
+            "tag_name": "v0.40.0", "html_url": "https://x/r", "draft": false, "prerelease": false,
+            "assets": [
+                {"name": "RustWTM-0.40.0-x64.msi", "browser_download_url": "https://dl/a.msi"},
+                {"name": "RustWTM-0.40.0-x64.msi.sha256", "browser_download_url": "https://dl/a.msi.sha256"},
+                {"name": "rustwtm_0.40.0_amd64.deb", "browser_download_url": "https://dl/rustwtm_0.40.0_amd64.deb"},
+                {"name": "rustwtm_0.40.0_amd64.deb.sha256", "browser_download_url": "https://dl/rustwtm_0.40.0_amd64.deb.sha256"}
+            ]
+        });
+        let r = parse_release(json.to_string().as_bytes()).unwrap();
+        assert_eq!(r.version, (0, 40, 0));
+        assert_eq!(
+            r.msi,
+            Some((
+                "https://dl/rustwtm_0.40.0_amd64.deb".into(),
+                "https://dl/rustwtm_0.40.0_amd64.deb.sha256".into()
+            ))
+        );
+        assert!(!installed_by_msi(Path::new("/tmp/rustwtm")));
+    }
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    #[cfg(windows)]
     #[test]
     fn repository_transfer_keeps_discovery_and_asset_pairs_on_the_same_identity() {
         for repository in ["ersinkoc/RustWTM", "rustwtm/rustwtm"] {
@@ -582,6 +665,7 @@ mod tests {
         assert_eq!(current(), parse_version(env!("CARGO_PKG_VERSION")).unwrap());
     }
 
+    #[cfg(windows)]
     #[test]
     fn reads_a_release_and_its_installer() {
         let r = parse_release(JSON.as_bytes()).unwrap();
@@ -653,6 +737,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_installer_is_checked_again_where_only_administrators_reach() {
         let msi = Download {
@@ -766,6 +851,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn this_test_binary_and_a_plain_file_have_no_publisher() {
         // Unsigned, as developer and every release build so far.
@@ -802,6 +888,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_elevated_publisher_check_runs_and_refuses_cleanly() {
         // The check alone, run in PowerShell on files that exist: nothing
@@ -908,6 +995,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_launcher_tells_what_happened_and_always_starts_rustwtm_again() {
         // The steps are stand-ins: nothing is elevated, installed or shown.
@@ -1111,6 +1199,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn knows_whether_it_runs_from_the_installed_folder() {
         let dir = Path::new(r"C:\Program Files\RustWTM\");

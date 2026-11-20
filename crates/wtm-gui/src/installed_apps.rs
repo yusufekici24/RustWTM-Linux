@@ -373,9 +373,11 @@ pub fn fixture() -> View {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 mod tests {
     use super::*;
     use egui_kittest::{Harness, kittest::Queryable};
+    #[cfg(windows)]
     #[test]
     fn filters_selection_and_confirmation_do_not_uninstall_until_confirmed() {
         let mut h = Harness::builder()

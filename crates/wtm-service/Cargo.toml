@@ -28,11 +28,16 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
-windows-service.workspace = true
-winreg.workspace = true
 
 [build-dependencies]
 winresource.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service.workspace = true
+winreg.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ctrlc = { workspace = true, features = ["termination"] }

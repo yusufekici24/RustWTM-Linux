@@ -15,6 +15,12 @@ use crate::backend::{Backend, Data, Mode, Panel, ServiceOp, UiCommand, describe}
 use crate::processes::{Intent, ManagedMap, ProcessView, context_menu, limit_labels};
 use crate::theme::{BAD, GOOD, WARN};
 use crate::tray::Tray;
+
+/// How to install and start the service from an elevated prompt.
+#[cfg(windows)]
+pub const SERVICE_START_COMMANDS: &str = "wtm-service install\nwtm-service start";
+#[cfg(not(windows))]
+pub const SERVICE_START_COMMANDS: &str = "sudo apt install rustwtm   # or: sudo wtm-service install\nsudo systemctl enable --now rustwtm";
 use crate::views;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4712,7 +4718,7 @@ fn governor(ui: &mut Ui, data: &Data, intents: &mut Vec<Intent>) {
                 ),
             );
             ui.add_space(0.0);
-            ui.code("wtm-service install\nwtm-service start");
+            ui.code(crate::app::SERVICE_START_COMMANDS);
         });
         return;
     };
@@ -6520,6 +6526,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_compact_status_bar_shows_the_memory_numbers_in_every_language() {
         // As the release review renders it (the rescue core on, a page
@@ -7684,6 +7691,7 @@ mod tests {
         assert!(h.state().state.charts.cursor.is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn full_app_navigates_every_tab() {
         let mut h = Harness::builder()
@@ -9309,6 +9317,7 @@ o-such-folder",
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn threads_panel_lists_busiest_threads_first_and_can_be_hidden() {
         use crate::threads_view::{ThreadRow, ThreadsPanel};
@@ -12165,6 +12174,7 @@ o-such-folder",
         }
     }
 
+    #[cfg(windows)]
     /// New product workspaces use synthetic data and never start a native query.
     #[test]
     fn render_product_expansion_review() {

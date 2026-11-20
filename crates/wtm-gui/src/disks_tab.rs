@@ -1277,6 +1277,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn flattening_follows_expansion_and_caps_children() {
         let many: Vec<_> = (0..CHILDREN_SHOWN + 3)

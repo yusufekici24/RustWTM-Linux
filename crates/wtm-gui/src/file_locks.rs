@@ -126,6 +126,7 @@ impl View {
 
 #[cfg(test)]
 impl View {
+    #[cfg_attr(not(windows), allow(unused_imports, dead_code))]
     pub fn fixture() -> Self {
         Self {
             path: r"C:\Example\report.xlsx".into(),

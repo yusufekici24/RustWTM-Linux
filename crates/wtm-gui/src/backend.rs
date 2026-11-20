@@ -3009,9 +3009,12 @@ fn notification(e: &Event) -> notify_rust::Notification {
         (Some(name), Some(pid)) => format!("RustWTM: {name} ({pid})"),
         _ => "RustWTM".to_owned(),
     };
-    notify_rust::Notification::new()
-        .app_id(APP_ID)
-        .appname("RustWTM")
+    let mut n = notify_rust::Notification::new();
+    #[cfg(windows)]
+    n.app_id(APP_ID);
+    #[cfg(target_os = "linux")]
+    n.icon("rustwtm");
+    n.appname("RustWTM")
         .summary(&title)
         .body(&crate::i18n::message(&e.message))
         .finalize()
@@ -3107,9 +3110,12 @@ fn container_event(notice: &crate::container_alerts::Notice) -> Event {
 
 /// The toast shown when Windows starts us instead of a blocked program.
 pub fn blocked_notification(name: &str) -> notify_rust::Notification {
-    notify_rust::Notification::new()
-        .app_id(APP_ID)
-        .appname("RustWTM")
+    let mut n = notify_rust::Notification::new();
+    #[cfg(windows)]
+    n.app_id(APP_ID);
+    #[cfg(target_os = "linux")]
+    n.icon("rustwtm");
+    n.appname("RustWTM")
         .summary(crate::i18n::tr("Program blocked"))
         .body(&{ crate::i18n::format("RustWTM prevented {0} from starting.", &[name.to_string()]) })
         .finalize()
@@ -3124,7 +3130,50 @@ pub fn reveal(path: &std::path::Path) -> io::Result<()> {
     open_location(&path.display().to_string())
 }
 
+/// Opens the file manager with `path` selected (the FileManager1 D-Bus
+/// interface Nautilus, Dolphin and Nemo implement), or its folder.
+#[cfg(target_os = "linux")]
+fn open_location(path: &str) -> io::Result<()> {
+    let uri = format!(
+        "file://{}",
+        path.replace('%', "%25")
+            .replace(' ', "%20")
+            .replace('\'', "%27")
+    );
+    let shown = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.FileManager1",
+            "--object-path",
+            "/org/freedesktop/FileManager1",
+            "--method",
+            "org.freedesktop.FileManager1.ShowItems",
+            &format!("['{uri}']"),
+            "",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if shown {
+        return Ok(());
+    }
+    let p = std::path::Path::new(path);
+    let folder = if p.is_dir() {
+        p
+    } else {
+        p.parent().unwrap_or(p)
+    };
+    std::process::Command::new("xdg-open")
+        .arg(folder)
+        .spawn()
+        .map(drop)
+}
+
 /// Opens Explorer with `path` selected.
+#[cfg(windows)]
 fn open_location(path: &str) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
     // Explorer parses its own command line and needs the path quoted.
@@ -3135,10 +3184,17 @@ fn open_location(path: &str) -> io::Result<()> {
 }
 
 /// AppUserModelID used for toast notifications.
+#[cfg_attr(not(windows), allow(dead_code))]
 const APP_ID: &str = "RustWTM.TaskManager";
 
 /// Registers the AppUserModelID under HKCU so notifications show "RustWTM"
 /// as their source. Per-user, no elevation needed; failures are harmless.
+#[cfg(target_os = "linux")]
+pub fn register_app_id() {
+    // The package installs rustwtm.desktop, which names the notifications.
+}
+
+#[cfg(windows)]
 pub fn register_app_id() {
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
@@ -3154,6 +3210,7 @@ pub fn autostart_enabled() -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 mod tests {
     use super::*;
 
@@ -3188,6 +3245,7 @@ mod tests {
         assert!(data.lock().unwrap().gui_objects.is_empty());
         assert!(data.lock().unwrap().process_states.is_empty());
     }
+    #[cfg(windows)]
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Command as Proc, Stdio};
 
@@ -3202,6 +3260,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn spawn() -> Guard {
         let g = Guard(
             Proc::new("cmd.exe")
@@ -3687,6 +3746,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn checks_for_and_installs_updates_in_the_background() {
         let mut w = worker();
@@ -3880,6 +3940,7 @@ mod tests {
         assert!(w.data().message.is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn local_mode_samples_loads_and_runs_commands() {
         let mut w = worker();
@@ -4149,6 +4210,7 @@ mod tests {
         })
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_limit_set_without_the_service_is_lifted_here_once_it_runs() {
         let child = spawn();
@@ -4756,6 +4818,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn startup_and_service_messages() {
         let denied = io::Error::from(io::ErrorKind::PermissionDenied);
@@ -4790,6 +4853,7 @@ mod tests {
         assert!(text.starts_with("Start Fax failed"), "{text}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn toggling_a_startup_entry_reports_and_reloads() {
         use winreg::RegKey;
@@ -4799,7 +4863,9 @@ mod tests {
         // The approval flag is written even without a matching Run value;
         // remove it again whatever happens.
         struct Cleanup(String);
+        #[cfg(windows)]
         impl Drop for Cleanup {
+            #[cfg(windows)]
             fn drop(&mut self) {
                 if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
                     .open_subkey_with_flags(APPROVED_RUN, KEY_SET_VALUE)
@@ -4828,6 +4894,7 @@ mod tests {
         assert!(w.data().startup.is_some());
     }
 
+    #[cfg(windows)]
     #[test]
     fn sampling_failure_keeps_the_last_sample_and_recovers_on_success() {
         let mut d = Data::default();
@@ -4897,6 +4964,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn local_samples_history_and_notifications() {
         let mut d = Data::default();
@@ -5065,6 +5133,7 @@ mod tests {
         assert!(cache.is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn new_processes_are_looked_up_outside_the_lock_once() {
         let snap = Sampler::new().sample().unwrap();
@@ -5085,6 +5154,7 @@ mod tests {
         assert!(again.command_lines.is_empty() && again.image_paths.is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn image_paths_and_icons_are_loaded_once() {
         let snap = Sampler::new().sample().unwrap();

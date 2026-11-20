@@ -688,17 +688,31 @@ pub struct SystemFilter {
 impl Default for SystemFilter {
     fn default() -> Self {
         Self {
-            always_show: [
-                "explorer.exe",
-                "cmd.exe",
-                "powershell.exe",
-                "notepad.exe",
-                "mmc.exe",
-                "regedit.exe",
-                "mstsc.exe",
-            ]
-            .map(String::from)
-            .to_vec(),
+            always_show: if cfg!(windows) {
+                [
+                    "explorer.exe",
+                    "cmd.exe",
+                    "powershell.exe",
+                    "notepad.exe",
+                    "mmc.exe",
+                    "regedit.exe",
+                    "mstsc.exe",
+                ]
+                .map(String::from)
+                .to_vec()
+            } else {
+                [
+                    "nautilus",
+                    "gnome-terminal-server",
+                    "bash",
+                    "gnome-text-editor",
+                    "gedit",
+                    "remmina",
+                    "ssh",
+                ]
+                .map(String::from)
+                .to_vec()
+            },
             also_hide: Vec::new(),
         }
     }
@@ -718,6 +732,16 @@ impl SystemFilter {
             || wtm_core::protection_reason(p.pid, &p.name).is_some_and(|r| r != "RustWTM itself")
         {
             return true;
+        }
+        if cfg!(target_os = "linux") {
+            // Linux: services outside any user session (system units and
+            // kernel workers), and session helpers that ship with the OS
+            // under /usr/lib and /usr/libexec (gvfs, evolution-data-server,
+            // xdg-desktop-portal, at-spi...).
+            let path = image_path.unwrap_or("");
+            return p.session_id == 0
+                || path.starts_with("/usr/libexec/")
+                || path.starts_with("/usr/lib/");
         }
         let path = image_path.unwrap_or("").to_lowercase();
         let root = windows_root();
@@ -3672,6 +3696,7 @@ mod tests {
         assert!(!view.tree_collapsed && view.tree_toggled.is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn system_processes_are_windows_components_and_the_lists_override() {
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());

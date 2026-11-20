@@ -360,6 +360,7 @@ mod tests {
         assert_eq!(parse_port("abc"), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn relays_are_explained_and_windows_is_left_alone() {
         assert!(relay_hint("wslrelay.exe").unwrap().contains("WSL"));

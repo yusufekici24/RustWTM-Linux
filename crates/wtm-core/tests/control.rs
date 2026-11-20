@@ -1,5 +1,7 @@
 //! End-to-end tests against real child processes.
+#![cfg_attr(not(windows), allow(unused_imports, dead_code))]
 
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
@@ -18,6 +20,7 @@ impl Drop for ChildGuard {
     }
 }
 
+#[cfg(windows)]
 fn spawn_cmd(script: &str) -> ChildGuard {
     let child = Command::new("cmd.exe")
         .raw_arg(format!("/d /c {script}"))
@@ -50,6 +53,7 @@ fn is_running(pid: u32, create_time: i64) -> bool {
         .any(|p| p.pid == pid && p.create_time == create_time)
 }
 
+#[cfg(windows)]
 #[test]
 fn suspend_resume_and_kill() {
     let mut child = spawn_cmd("ping -n 60 127.0.0.1");
@@ -86,6 +90,7 @@ fn suspend_resume_and_kill() {
     assert_eq!(status.code(), Some(1));
 }
 
+#[cfg(windows)]
 #[test]
 fn priority_affinity_and_eco_round_trip() {
     let child = spawn_cmd("ping -n 60 127.0.0.1");
@@ -113,6 +118,7 @@ fn priority_affinity_and_eco_round_trip() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn refuses_protected_and_stale_targets() {
     let procs = snapshot();
@@ -176,6 +182,7 @@ fn refuses_protected_and_stale_targets() {
     ));
 }
 
+#[cfg(windows)]
 #[test]
 fn kill_tree_kills_descendants() {
     let root = spawn_cmd("ping -n 60 127.0.0.1");
@@ -199,6 +206,7 @@ fn kill_tree_kills_descendants() {
     assert!(!is_running(root_ref.pid, root_ref.create_time));
 }
 
+#[cfg(windows)]
 #[test]
 fn kill_tree_spares_the_children_of_a_reused_pid() {
     let root = spawn_cmd("ping -n 60 127.0.0.1");
@@ -240,6 +248,7 @@ fn measure_cpu(target: &ProcessRef, window: Duration) -> f32 {
         .map_or(0.0, |p| p.cpu_percent)
 }
 
+#[cfg(windows)]
 #[test]
 fn job_hard_cap_throttles_busy_process() {
     let child = spawn_cmd("for /l %i in (0,0,1) do @rem");
@@ -292,6 +301,7 @@ fn missing_pid_is_not_found() {
     ));
 }
 
+#[cfg(windows)]
 #[test]
 fn image_path_without_identity_check() {
     let child = spawn_cmd("ping -n 60 127.0.0.1");
@@ -302,6 +312,7 @@ fn image_path_without_identity_check() {
     assert!(path.to_lowercase().ends_with("cmd.exe"), "{path}");
 }
 
+#[cfg(windows)]
 #[test]
 fn invalid_affinity_is_a_sys_error() {
     let child = spawn_cmd("ping -n 60 127.0.0.1");
@@ -324,6 +335,7 @@ fn own_priority_and_debug_privilege() {
     let _ = control::enable_debug_privilege();
 }
 
+#[cfg(windows)]
 #[test]
 fn limiter_tracks_lifts_and_forgets_targets() {
     let a = spawn_cmd("ping -n 60 127.0.0.1");
@@ -357,6 +369,7 @@ fn limiter_tracks_lifts_and_forgets_targets() {
     assert_eq!(limiter.limited().count(), 0);
 }
 
+#[cfg(windows)]
 #[test]
 fn memory_only_limit_and_lift() {
     let child = spawn_cmd("ping -n 60 127.0.0.1");

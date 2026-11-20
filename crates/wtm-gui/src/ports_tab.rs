@@ -1002,6 +1002,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_busy_port_can_be_freed() {
         let mut h = harness(PortsView {

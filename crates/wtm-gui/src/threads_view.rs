@@ -377,6 +377,7 @@ mod tests {
         assert_eq!(out[1].start, None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn this_process_lists_its_own_thread_with_a_start_routine() {
         let data = Mutex::new(Data::default());

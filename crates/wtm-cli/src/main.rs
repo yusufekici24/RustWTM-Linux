@@ -21,7 +21,18 @@ use wtm_core::control::{self, EcoQos, PriorityClass};
 use wtm_core::{Sampler, SortKey, sort_processes};
 
 #[derive(Parser)]
-#[command(name = "wtm", version, about = "RustWTM - Windows task manager")]
+#[cfg_attr(
+    windows,
+    command(name = "wtm", version, about = "RustWTM - Windows task manager")
+)]
+#[cfg_attr(
+    not(windows),
+    command(
+        name = "wtm",
+        version,
+        about = "RustWTM - task manager and resource governor"
+    )
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -684,6 +695,7 @@ mod tests {
     use wtm_ipc::{Client, PROTOCOL_VERSION, Request, Response, read_frame, write_frame};
     use wtm_policy::{AppStats, Finding, FindingKind};
 
+    #[cfg(windows)]
     #[test]
     fn a_process_started_after_the_port_lookup_is_no_owner() {
         let procs = Sampler::new().sample().unwrap().processes;

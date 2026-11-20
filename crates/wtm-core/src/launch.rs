@@ -160,6 +160,7 @@ mod tests {
         assert_eq!(split(exe), Some((exe, "")));
     }
 
+    #[cfg(windows)]
     #[test]
     fn run_reports_problems() {
         const MISSING: &str = r"C:\definitely\missing-program.exe";
@@ -199,6 +200,7 @@ mod tests {
         let _ = is_elevated();
     }
 
+    #[cfg(windows)]
     #[test]
     fn waits_for_a_replaced_process_to_exit() {
         use std::time::{Duration, Instant};

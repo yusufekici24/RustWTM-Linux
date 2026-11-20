@@ -122,6 +122,8 @@ jobs:
             dist/${{ env.ASSET }}.sha256
             dist/*.msi
             dist/*.msi.sha256
+            dist/rustwtm_*_amd64.deb
+            dist/rustwtm_*_amd64.deb.sha256
             dist/notes.md
           if-no-files-found: error
 
@@ -220,9 +222,29 @@ jobs:
           path: dist/signed/*
           if-no-files-found: error
 
+  build-linux:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+      - name: Toolchain
+        run: rustup show
+      - name: Package
+        run: packaging/linux/build-deb.sh
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-linux
+          path: dist/rustwtm_*_amd64.deb*
+
   provenance:
-    needs: [build, sign, website-media]
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.website-media.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
+    needs: [build, build-linux, sign, website-media]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.build-linux.result == 'success' && needs.website-media.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -235,6 +257,10 @@ jobs:
           path: dist
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
+          name: release-linux
+          path: dist
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
           name: website-media
           path: dist
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -242,9 +268,10 @@ jobs:
           subject-path: |
             dist/*.zip
             dist/*.msi
+            dist/*.deb
 
   publish:
-    needs: [build, sign, provenance, website-media]
+    needs: [build, build-linux, sign, provenance, website-media]
     if: ${{ !cancelled() && needs.build.result == 'success' && needs.provenance.result == 'success' && needs.website-media.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
@@ -255,6 +282,10 @@ jobs:
           name: ${{ vars.WINDOWS_SIGNING_PROVIDER == 'azure-artifact-signing' && 'release-signed' || 'release-unsigned' }}
           path: dist
 
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-linux
+          path: dist
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: website-media

@@ -311,6 +311,7 @@ impl View {
 
 #[cfg(test)]
 impl View {
+    #[cfg_attr(not(windows), allow(unused_imports, dead_code))]
     pub fn fixture() -> Self {
         let frames = (0..60)
             .map(|i| wtm_core::incidents::Frame {

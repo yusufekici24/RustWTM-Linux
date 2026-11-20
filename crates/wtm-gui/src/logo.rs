@@ -271,6 +271,7 @@ mod tests {
         assert_eq!(last_size, 40 + 256 * 256 * 4 + 32 * 256);
     }
 
+    #[cfg(windows)]
     #[test]
     fn executable_embeds_the_product_icon() {
         let path = std::env::current_exe().unwrap();

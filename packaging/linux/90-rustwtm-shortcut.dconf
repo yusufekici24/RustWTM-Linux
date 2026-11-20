@@ -1,0 +1,10 @@
+# Optional fleet default: Ctrl+Shift+Esc opens RustWTM for every GNOME user.
+# Installed to /etc/dconf/db/local.d/ only when RUSTWTM_SHORTCUT=1 is given to
+# the deployment script; users can still change it in Settings > Keyboard.
+[org/gnome/settings-daemon/plugins/media-keys]
+custom-keybindings=['/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/rustwtm/']
+
+[org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/rustwtm]
+name='RustWTM'
+command='/usr/bin/rustwtm --task-manager'
+binding='<Control><Shift>Escape'

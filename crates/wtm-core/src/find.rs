@@ -207,6 +207,14 @@ mod tests {
 
     /// Searches this test process only: other programs' handles and modules
     /// are their own business, and a full search takes seconds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finds_its_own_shared_objects() {
+        let (hits, progress) = own_search("libc.so", FindLimits::default());
+        assert!(hits.iter().any(|h| h.kind == HitKind::Dll), "{hits:?}");
+        assert!(progress.done);
+    }
+
     fn own_search(query: &str, limits: FindLimits) -> (Vec<FindHit>, FindProgress) {
         let cancel = AtomicBool::new(false);
         let mut all = Vec::new();
@@ -220,6 +228,7 @@ mod tests {
         (all, progress)
     }
 
+    #[cfg(windows)]
     #[test]
     fn finds_its_own_file_and_dll() {
         let unique = format!("rustwtm-find-{}", std::process::id());
@@ -254,6 +263,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn dlls_match_by_path_and_hits_stop_at_the_cap() {
         let (hits, progress) = own_search(

@@ -903,14 +903,19 @@ mod tests {
         assert!(!holds_secrets("notepad.exe") && !holds_secrets("lsass.exe.bak"));
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+    #[cfg_attr(not(windows), allow(dead_code))]
     const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    #[cfg_attr(not(windows), allow(dead_code))]
     const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 
+    #[cfg(windows)]
     fn nt(status: u32) -> wtm_sys::Error {
         wtm_sys::Error::Nt { call: "x", status }
     }
 
+    #[cfg(windows)]
     #[test]
     fn classifies_open_and_call_failures() {
         assert!(matches!(
@@ -935,6 +940,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_failed_lift_still_lifts_the_rest_and_keeps_the_job() {
         let t = ProcessRef {
@@ -1145,6 +1151,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn maps_its_own_memory_but_never_that_of_the_sign_in_secrets_holders() {
         let created = ProcessHandle::open(std::process::id(), Access::QUERY)
@@ -1213,6 +1220,7 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
     #[test]
     fn confines_and_releases_cpu_sets_without_clobbering_foreign_ones() {
         let mut child = std::process::Command::new("ping")

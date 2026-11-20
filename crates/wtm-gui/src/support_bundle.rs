@@ -109,10 +109,7 @@ pub fn service_logs_dir() -> PathBuf {
         // Tests never read this PC's real log.
         return std::env::temp_dir().join("rustwtm-test-no-service-logs");
     }
-    std::env::var_os("ProgramData")
-        .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
-        .join("RustWTM")
-        .join("logs")
+    wtm_sys::compat::machine_data_dir().join("logs")
 }
 
 /// The input for this window, with the service log read now.
@@ -157,7 +154,7 @@ impl Account {
     pub fn current() -> Self {
         Self {
             redactor: wtm_ai::Redactor::for_current_user(),
-            profile: std::env::var("USERPROFILE").ok(),
+            profile: std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok(),
         }
     }
 }

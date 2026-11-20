@@ -252,6 +252,7 @@ fn show_other_instance() {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 mod tests {
     use super::blocked_program;
 
@@ -283,6 +284,7 @@ mod tests {
             .into_iter()
     }
 
+    #[cfg(windows)]
     #[test]
     fn recognizes_blocked_launches() {
         assert_eq!(blocked_program(args(&[])), None);

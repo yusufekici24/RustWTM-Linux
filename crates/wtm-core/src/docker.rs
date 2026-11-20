@@ -17,8 +17,26 @@ pub struct Endpoint {
     pub context: String,
     pub pipe: String,
 }
+/// The engine a default context talks to.
+#[cfg(windows)]
+const DEFAULT_HOST: &str = "npipe:////./pipe/docker_engine";
+#[cfg(target_os = "linux")]
+const DEFAULT_HOST: &str = "unix:///var/run/docker.sock";
+
 impl Endpoint {
     pub fn from_host(context: String, host: &str) -> Result<Self, String> {
+        // Linux: a local Unix socket (unix:///var/run/docker.sock, or a
+        // rootless engine's $XDG_RUNTIME_DIR/docker.sock).
+        #[cfg(target_os = "linux")]
+        if let Some(path) = host.strip_prefix("unix://") {
+            if !path.starts_with('/') || path.len() > 256 || path.contains("..") {
+                return Err("Invalid local Docker socket".into());
+            }
+            return Ok(Self {
+                context,
+                pipe: path.to_owned(),
+            });
+        }
         let suffix = host
             .strip_prefix("npipe:////./pipe/")
             .or_else(|| host.strip_prefix(r"npipe://\\.\pipe\"))
@@ -39,7 +57,10 @@ impl Endpoint {
     pub fn discover() -> Result<Self, String> {
         let home = std::env::var_os("DOCKER_CONFIG")
             .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var_os("USERPROFILE").map(|p| Path::new(&p).join(".docker")))
+            .or_else(|| {
+                std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                    .map(|p| Path::new(&p).join(".docker"))
+            })
             .ok_or("Docker user configuration directory is unavailable")?;
         Self::resolve(
             &home,
@@ -73,7 +94,7 @@ impl Endpoint {
             .filter(|s| !s.is_empty())
             .unwrap_or("default".into());
         if context == "default" {
-            return Self::from_host(context, "npipe:////./pipe/docker_engine");
+            return Self::from_host(context, DEFAULT_HOST);
         }
         let entries = std::fs::read_dir(home.join("contexts/meta"))
             .map_err(|_| "Docker context metadata is unavailable")?;

@@ -2,17 +2,16 @@
 //! belongs on a dedicated worker, never the GUI or the governor's sample loop.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use wtm_sys::compat::NoWindow;
 
 use serde::{Deserialize, Serialize};
 
 pub const STALE_MS: u64 = 10_000;
 const MAX_REPLY: usize = 2 * 1024 * 1024;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub fn unix_ms() -> u64 {
     SystemTime::now()
@@ -128,7 +127,7 @@ impl Bridge {
     fn start(path: PathBuf, writable: bool) -> Result<Self, String> {
         let mut child = Command::new(path)
             .arg(if writable { "--control" } else { "--read-only" })
-            .creation_flags(CREATE_NO_WINDOW)
+            .no_window()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -223,6 +222,10 @@ impl Drop for Bridge {
 }
 
 fn helper_path() -> Option<PathBuf> {
+    // Linux reads hwmon directly (see `nvidia_snapshot`); no provider.
+    if cfg!(not(windows)) {
+        return None;
+    }
     let exe = std::env::current_exe().ok()?;
     let path = exe.parent()?.join("hardware/wtm-hardware.exe");
     if path.is_file() {
@@ -365,6 +368,33 @@ impl HardwareReader {
     }
 }
 
+/// Linux: every hwmon sensor (CPU package and cores, NVMe, ACPI thermal
+/// zones, fans, voltages, power), plus nvidia-smi when the NVIDIA driver is
+/// installed. Fan control stays with the firmware: read-only.
+#[cfg(target_os = "linux")]
+fn nvidia_snapshot() -> Result<HardwareReport, String> {
+    let mut report = linux_hwmon::snapshot(unix_ms());
+    let smi = PathBuf::from("/usr/bin/nvidia-smi");
+    if smi.is_file()
+        && let Ok(out) = Command::new(&smi)
+            .args(["--query-gpu=uuid,name,temperature.gpu,fan.speed,power.draw,clocks.current.graphics,clocks.current.memory", "--format=csv,noheader,nounits"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        && out.status.success()
+        && let Ok(nv) = parse_nvidia(&String::from_utf8_lossy(&out.stdout), report.sampled_at_ms)
+    {
+        report.sensors.extend(nv.sensors);
+        report.provider.push_str(" + NVIDIA driver");
+    }
+    Ok(report)
+}
+
+#[cfg(target_os = "linux")]
+#[path = "linux/hwmon.rs"]
+mod linux_hwmon;
+
+#[cfg(windows)]
 fn nvidia_snapshot() -> Result<HardwareReport, String> {
     let windows = std::env::var_os("WINDIR").ok_or("Windows directory is unavailable")?;
     let exe = PathBuf::from(windows).join("System32/nvidia-smi.exe");
@@ -372,7 +402,7 @@ fn nvidia_snapshot() -> Result<HardwareReport, String> {
         return Ok(HardwareReport { notice: "Build/install the optional hardware provider for CPU, motherboard, storage and fan sensors. No NVIDIA sensor provider was found.".into(), ..Default::default() });
     }
     let mut child = Command::new(exe).args(["--query-gpu=uuid,name,temperature.gpu,fan.speed,power.draw,clocks.current.graphics,clocks.current.memory", "--format=csv,noheader,nounits"])
-        .creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| e.to_string())?;
+        .no_window().stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| e.to_string())?;
     let output = child
         .stdout
         .take()

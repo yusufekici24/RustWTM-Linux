@@ -53,7 +53,8 @@ pub enum BlockRoot {
     /// The real Image File Execution Options key (needs elevation).
     System,
     /// A scratch key under HKCU (tests).
-    #[cfg_attr(not(test), expect(dead_code))]
+    #[cfg_attr(all(not(test), windows), expect(dead_code))]
+    #[cfg_attr(not(windows), allow(dead_code))]
     User(String),
 }
 
@@ -74,7 +75,14 @@ impl Paths {
     }
 }
 
+/// `/var/lib/rustwtm`.
+#[cfg(target_os = "linux")]
+pub fn default_data_dir() -> PathBuf {
+    PathBuf::from("/var/lib/rustwtm")
+}
+
 /// `%ProgramData%\RustWTM`.
+#[cfg(windows)]
 pub fn default_data_dir() -> PathBuf {
     std::env::var_os("ProgramData")
         .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
@@ -84,6 +92,10 @@ pub fn default_data_dir() -> PathBuf {
 /// The command Windows runs instead of a blocked program: the GUI next to
 /// this executable, which tells the user and exits.
 fn block_debugger() -> Option<String> {
+    // Linux refuses the exec itself; nothing runs instead.
+    if cfg!(target_os = "linux") {
+        return Some(String::new());
+    }
     let gui = std::env::current_exe().ok()?.with_file_name("rustwtm.exe");
     gui.exists()
         .then(|| format!("\"{}\" --blocked", gui.display()))
@@ -99,11 +111,14 @@ fn open_blocker(root: &BlockRoot, debugger: Option<String>, events: &EventLog) -
     };
     let opened = match root {
         BlockRoot::System => Blocker::system(debugger),
+        #[cfg(windows)]
         BlockRoot::User(path) => Blocker::at(
             winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER),
             path,
             debugger,
         ),
+        #[cfg(target_os = "linux")]
+        BlockRoot::User(_) => Ok(Blocker::detached()),
     };
     opened
         .inspect_err(|e| events.warn(None, format!("program blocking disabled: {e}")))
@@ -1087,8 +1102,10 @@ fn evaluate_insights(
 }
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Command as Proc, Stdio};
     use std::sync::mpsc;
@@ -1124,6 +1141,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn spawn(exe: &Path) -> Guard {
         Guard(start(
             Proc::new(exe)
@@ -1149,6 +1167,7 @@ mod tests {
         (!matches!(r, Response::Error(_))).then(|| expect_reply!(r, Response::Snapshot))
     }
 
+    #[cfg(windows)]
     #[test]
     fn rules_act_once_enforcing_and_are_taken_back_when_removed() {
         let dir = std::env::temp_dir().join(format!("wtm-engine-reload-{}", std::process::id()));
@@ -1221,6 +1240,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn engine_serves_clients_enforces_rules_and_reloads_config() {
         let dir = std::env::temp_dir().join(format!("wtm-engine-test-{}", std::process::id()));
@@ -1429,6 +1449,7 @@ mod tests {
         let _ = hkcu.delete_subkey_all(&block_key);
     }
 
+    #[cfg(windows)]
     #[test]
     fn block_list_follows_dry_run_and_reports_problems() {
         let key = format!(r"Software\RustWTM-test-engine-sync-{}", std::process::id());
@@ -1526,6 +1547,7 @@ mod tests {
         dir
     }
 
+    #[cfg(windows)]
     #[test]
     fn engine_without_ipc_or_history_still_serves_control_messages() {
         let dir = temp_dir("engine-degraded");
@@ -1569,6 +1591,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn engine_resolves_rule_paths_and_raises_history_insights() {
         let dir = temp_dir("engine-insights");
@@ -1642,6 +1665,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 mod unit_tests {
     use super::*;
 
@@ -1666,6 +1690,7 @@ mod unit_tests {
         assert!(d < Duration::from_secs(1), "{d:?}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_power_plan_left_by_a_crash_is_put_back_once() {
         let dir = std::env::temp_dir().join(format!("wtm-plan-{}", std::process::id()));
@@ -1704,6 +1729,7 @@ mod unit_tests {
             ]
         );
     }
+    #[cfg(windows)]
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Command as Proc, Stdio};
 
@@ -1721,6 +1747,7 @@ mod unit_tests {
         }
     }
 
+    #[cfg(windows)]
     fn spawn() -> Guard {
         let g = Guard(
             Proc::new("cmd.exe")
@@ -1735,6 +1762,7 @@ mod unit_tests {
         g
     }
 
+    #[cfg(windows)]
     #[test]
     fn stuck_swarm_copies_are_previewed_in_dry_run_and_ended_when_enforcing() {
         let dir = std::env::temp_dir().join(format!("wtm-swarm-end-{}", std::process::id()));
@@ -1812,6 +1840,7 @@ mod unit_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn handle_control_runs_every_command() {
         let a = spawn();
@@ -1868,6 +1897,7 @@ mod unit_tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn manual_choices_outlast_rollbacks_and_unlimit_reports_nothing_to_do() {
         let a = spawn();
@@ -2043,6 +2073,7 @@ mod unit_tests {
         assert!(shared.findings.read().unwrap().is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn watcher_exits_once_the_engine_is_gone() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2113,6 +2144,7 @@ mod unit_tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn path_lookups_are_cached_per_process_instance() {
         let child = spawn();
@@ -2127,6 +2159,7 @@ mod unit_tests {
         assert_eq!(cache.len(), 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn status_reflects_config_and_executor() {
         let config = Config::default();

@@ -389,6 +389,7 @@ fn hold(
 }
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(unused_imports, dead_code))]
 mod tests {
     use super::*;
     use std::process::{Child, Command, Stdio};
@@ -568,6 +569,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn hold_lifts_limits_when_stopped() {
         let child = Guard(
