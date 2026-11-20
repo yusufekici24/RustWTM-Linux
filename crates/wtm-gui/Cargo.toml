@@ -62,3 +62,6 @@ winreg.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 # The tray icon lives on a GTK thread of its own (tray-icon needs GTK there).
 gtk = "0.18"
+# Native windows on both desktops: without these winit / glutin cannot use
+# the Wayland or X11 window they are given ("native window is not supported").
+eframe = { workspace = true, features = ["wayland", "x11"] }

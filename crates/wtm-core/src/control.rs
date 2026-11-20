@@ -1045,7 +1045,10 @@ mod tests {
             name: "me.exe".into(),
         };
         let t = token(&me).unwrap();
-        assert!(!t.groups.is_empty() && !t.privileges.is_empty());
+        assert!(!t.groups.is_empty());
+        // Linux reports capabilities as privileges: none for a normal user.
+        #[cfg(windows)]
+        assert!(!t.privileges.is_empty());
         // The same ID, now another process: refused, not read.
         let reused = ProcessRef {
             create_time: created + 1,
