@@ -54,7 +54,7 @@ Priority: optional
 Architecture: $arch
 Maintainer: RustWTM Linux port <info@rustwtm.com>
 Installed-Size: $size
-Depends: libc6 (>= 2.35), systemd, libgtk-3-0t64 | libgtk-3-0
+Depends: libc6 (>= 2.35), systemd, libgtk-3-0t64 | libgtk-3-0, libegl1, libgl1, libwayland-client0, libwayland-egl1, libxkbcommon0, libxkbcommon-x11-0
 Recommends: libayatana-appindicator3-1, pkexec | policykit-1, zenity, libnotify-bin, power-profiles-daemon
 Suggests: gdb, wmctrl, x11-utils, iw, nvme-cli
 Homepage: https://rustwtm.com
