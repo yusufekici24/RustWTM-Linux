@@ -1,0 +1,69 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "dfmt recall --save --format md",
+            "statusMessage": "Saving session snapshot for next session...",
+            "timeout": 30,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|mcp__dfmt__dfmt_write|mcp__dfmt__dfmt_edit|mcp__dfmt__dfmt_exec",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -I \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard_exhaustion.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking for resource-exhaustion code..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "dfmt hook claude-code pretooluse",
+            "statusMessage": "Routing through dfmt for token savings...",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|Read|WebFetch|Grep|Task|Edit|Write|Glob"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "if [ -f .dfmt/last-recall.md ]; then echo '--- Previous session summary ---' && cat .dfmt/last-recall.md && echo '--- End of previous session ---'; fi",
+            "statusMessage": "Loading previous session summary...",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "mcp__dfmt__dfmt_exec",
+      "mcp__dfmt__dfmt_read",
+      "mcp__dfmt__dfmt_fetch",
+      "mcp__dfmt__dfmt_remember",
+      "mcp__dfmt__dfmt_search",
+      "mcp__dfmt__dfmt_recall",
+      "mcp__dfmt__dfmt_stats",
+      "mcp__dfmt__dfmt_glob",
+      "mcp__dfmt__dfmt_grep",
+      "mcp__dfmt__dfmt_edit",
+      "mcp__dfmt__dfmt_write"
+    ]
+  }
+}

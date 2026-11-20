@@ -1,0 +1,67 @@
+# Product completion roadmap
+
+0.28.0 adds [hardware specifications and installed applications](inventory-app-management.md),
+including confirmed uninstaller handoff and the [repository-transfer bridge](repository-migration.md).
+The 0.29.0 [product expansion](product-expansion.md) implements device
+workspaces/health, Store/WinGet management, bounded incident replay, file owners,
+visual policies, onboarding and numeric tray icons. See that document for exact
+validation and hardware/VM limits, separate from the [0.28.0 scope](0.28.0-review.md).
+
+Baseline: 0.25.0, reviewed on 2026-11-04. An implementation or a CI definition
+is not equivalent to hosted validation or a published feature. Record those
+outcomes separately.
+
+The [hardware product plan](hardware-product-plan.md), reviewed after 0.27.2,
+sets the next delivery priority: device identity, disk health, battery and
+device-specific graphs, paired with consistent interaction and visual review.
+Its original stages remain acceptance guidance; current implementation status
+is recorded in the product expansion rather than inferred from this baseline.
+
+The [desktop experience plan](desktop-experience-plan.md), reviewed against
+0.26.2 on 2026-11-09, expands the UI and diagnosis backlog into implementation
+milestones: shared resource context, stable process inspection, interactive
+charts, historical attribution, file ownership, onboarding, background refresh,
+battery/disk health and local organization. It records source-confirmed gaps
+and acceptance gates. The first visual subset, stable live process inspection
+and column profiles/order editing are implemented locally; the remaining
+milestone scope stays proposed.
+
+| Priority | Work | Concrete acceptance gate | Current boundary |
+| --- | --- | --- | --- |
+| P0 | Windows publisher signing | Own executable payload signed before MSI build; MSI signed; trust/publisher/timestamp verified; final digests match downloaded files | Optional Azure/OIDC workflow prepared; owner identity/account configuration and first signed release required |
+| P0 | Build provenance | ZIP/MSI attestation verifies repository, workflow and exact source commit | Release provenance job defined; CI uses a real installer artifact as its verification control |
+| P0 | Upgrade durability | Previous release -> candidate, repair, downgrade rejection, config byte retention, SQLite record retention, service IPC and uninstall retention | Dedicated disposable-VM job defined; never run on developer hardware |
+| P1 | Visual CI | Gauge gallery at four DPI scales; Overview/Performance/Containers in five languages, both themes and sizes; screenshots uploaded | GPU rendering job defined; image artifacts aid review, not automatic pixel-diff acceptance |
+| P1 | Interactive charts | Explicit time ranges, synchronized cursor, zoom/reset, real timestamps and event markers; correct missing/stale samples; keyboard access | Bounded timeline, CPU tier/GPU engine filters and recent per-device charts are implemented; [timeline](performance-timeline.md), [resource views](performance-resources.md). Unreleased: live rate graphs keep their scale for ten seconds after a burst leaves the view, and fit an inspected range exactly. The service keeps each disk's, network adapter's and GPU's per-minute average and peak for a week under names that survive restarts, shown for 1 h / 24 h / 7 days on the device's page with gaps and coverage. Further axis controls and persistent system-wide minutes remain pending |
+| P1 | Guided first use | Explain service/elevation/capabilities, monitoring vs protection, safe profile choices and what will change before enabling controls | Welcome guide, shortcut reference and reviewed policy profiles included in 0.29.0 |
+| P1 | Unified diagnosis | Correlate process, system, sensor, governor and container events by timestamp; explain source and uncertainty; navigate to existing details | Persistent system/contributor replay and protection-event correlation included in 0.29.0. Unreleased: Events and the chart markers merge the service's log, window actions and container alerts by time with a source column, a per-source note on timing and retention, and links to the process (only while the same PID and name run), Containers or Sensors; the service logs lasting sensor-reading failures and fan-control fallbacks while the sensor helper runs. Container alerts stay window-only (not in recorded incidents); no sensor threshold events |
+| P2 | Personal dashboard | Persist card visibility/order with a default/reset path; responsive layout, keyboard operation and migration tests | Unreleased: Overview cards (five resource cards, five sections) can be hidden and reordered within their group from a keyboard-operable editor with Apply/Cancel and *Restore default layout*; saved as hidden cards so new ones show, unknown ones dropped without losing other preferences. Warnings are not hideable. No drag-and-drop or resizing |
+| P2 | Docker persistence and alerts | Bounded retention, container identity across restart/removal, duration-based thresholds and recovery notices; distinguish Docker CPU conventions | Unreleased: opt-in container alerts (CPU share of the container's CPUs, memory share of its limit, duration, recovery and stop notices, five-minute quiet time) followed by name across restart and re-creation, read every 10 s in the background while on. A container's last 24 hours (per-minute CPU and memory average and peak, gaps kept) is saved by context and name to `%LOCALAPPDATA%\RustWTM`, filled only while Docker is read |
+| P2 | Support bundle | User-selected export with version/capability status, recent errors and redaction; exclude credentials, private command lines and container logs by default | Unreleased: About exports a previewed text bundle (diagnostics, service status, recent warnings and errors, service log warnings) with secrets and the account always hidden and process names and paths opt-in. No selectable time range or incident timeline yet |
+| P2 | Updater publisher policy | Signed builds reject wrong-publisher/unsigned updates after secure copy; test canceled UAC, installer error and relaunch | Unreleased: a signed build accepts only an installer with a valid embedded signature whose certificate subject equals its own (checked before the administrator prompt and again on the administrator-only copy); an unsigned build, like every release so far, still relies on the release's SHA-256. The outcome (installed, restart needed, canceled, stopped, installer error) is told after the relaunch; canceled prompts, installer errors, wrong publishers and relaunch are tested with stand-in steps and real unelevated processes. No rollback is claimed; the state after a failed upgrade awaits the upgrade-durability gate |
+| P2 | Local native TCP test boundary | Safe ephemeral-listener proof and independent Win32 control; no weaker assertions; pass locally and in hosted Windows | Local listener and port tests now pass with exact OS listener-table confirmation; unconfirmed raw states stay unknown |
+| Manual hardware gate | Physical cooling certification | Per-model RPM/curve/default-restoration, stale sensor, disconnect and lease-expiry evidence, within firmware safety limits | Simulation checks do not certify a physical channel; no fan writes authorized by this roadmap |
+
+## Delivery order
+
+First establish distribution and automated evidence: signing preparation,
+provenance, installer lifecycle and visual CI. Next build chart interaction and
+guided first use, then a shared diagnosis timeline. Dashboard customization,
+container history/alerts and support exports follow those foundations.
+
+For long histories, store bounded aggregates with timestamps and provenance;
+do not extrapolate absent samples into invented zero usage. Container history
+needs an explicit schema/retention decision and does not belong in per-process
+application rows. Unified diagnosis should correlate observations before any
+automatic recommendation is allowed to change enforcement.
+
+## Validation separation
+
+- Local checks: PowerShell parsing, workflow lint, real signed Windows-file
+  control, rejection of unsigned/wrong-publisher files, and refusal of installer
+  execution outside the explicitly enabled disposable runner.
+- Hosted CI: source tests/coverage, fresh install, upgrade/repair/data retention,
+  localized rendering and provenance verification of the candidate MSI.
+- Release: actual signing only after account setup, final-byte checksums,
+  downloaded executable/MSI identity, and release-workflow provenance.
+- Manual: identity validation and physical hardware controls stay owner-operated.

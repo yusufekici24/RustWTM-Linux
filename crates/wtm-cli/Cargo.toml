@@ -1,0 +1,34 @@
+[package]
+name = "wtm-cli"
+description = "Command-line interface for RustWTM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wtm"
+path = "src/main.rs"
+
+[dependencies]
+wtm-ai.workspace = true
+wtm-core.workspace = true
+wtm-ipc.workspace = true
+wtm-policy.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ctrlc.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+wtm-sys.workspace = true
+
+[build-dependencies]
+winresource.workspace = true
+
+[lints]
+workspace = true

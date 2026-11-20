@@ -1,0 +1,1138 @@
+//! Applies decisions and keeps every source's actions separate.
+//!
+//! For each process we store the actions requested per [`Source`] plus the
+//! process's original priority / EcoQoS. The state actually applied is the
+//! fold of all sources (lowest priority, tightest caps, any eco/suspend), so
+//! when one source rolls back, the others' limits stay in force.
+
+use std::collections::{HashMap, HashSet};
+use std::mem::discriminant;
+
+use wtm_core::control::{
+    self, EcoQos, IoPriority, Limiter, Limits, MemoryPriority, PriorityClass, ProcessRef,
+};
+use wtm_ipc::Managed;
+use wtm_policy::{Action, Decision, IoLevel, MemoryLevel, PriorityLevel, Source};
+
+use crate::events::EventLog;
+
+type Key = (u32, i64);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Effective {
+    priority: Option<PriorityLevel>,
+    eco_qos: bool,
+    io: Option<IoLevel>,
+    memory_priority: Option<MemoryLevel>,
+    cpu_cap: Option<f32>,
+    memory_bytes: Option<u64>,
+    suspended: bool,
+}
+
+impl Effective {
+    fn fold<'a>(actions: impl IntoIterator<Item = &'a Action>) -> Self {
+        let mut e = Self::default();
+        for a in actions {
+            match *a {
+                Action::Priority(p) => e.priority = Some(e.priority.map_or(p, |q| q.min(p))),
+                Action::EcoQos => e.eco_qos = true,
+                Action::IoPriority(l) => e.io = Some(e.io.map_or(l, |m| m.min(l))),
+                Action::MemoryPriority(l) => {
+                    e.memory_priority = Some(e.memory_priority.map_or(l, |m| m.min(l)));
+                }
+                Action::CpuCap(c) => e.cpu_cap = Some(e.cpu_cap.map_or(c, |d| d.min(c))),
+                Action::MemoryCapMb(mb) => {
+                    let b = mb.saturating_mul(1 << 20);
+                    e.memory_bytes = Some(e.memory_bytes.map_or(b, |d| d.min(b)));
+                }
+                Action::Suspend => e.suspended = true,
+                Action::Kill | Action::TrimMemory | Action::CpuCapRelative(_) => {}
+            }
+        }
+        e
+    }
+
+    fn limits(&self) -> Limits {
+        Limits {
+            cpu_percent: self.cpu_cap,
+            memory_bytes: self.memory_bytes,
+        }
+    }
+
+    fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(p) = self.priority {
+            parts.push(format!("{p:?}"));
+        }
+        if self.eco_qos {
+            parts.push("efficiency mode".into());
+        }
+        if let Some(l) = self.io {
+            parts.push(format!("I/O priority {l}"));
+        }
+        if let Some(l) = self.memory_priority {
+            parts.push(format!("memory priority {l}"));
+        }
+        if let Some(c) = self.cpu_cap {
+            parts.push(format!("CPU ≤ {c:.2}%"));
+        }
+        if let Some(m) = self.memory_bytes {
+            parts.push(format!("memory ≤ {} MiB", m >> 20));
+        }
+        if self.suspended {
+            parts.push("suspended".into());
+        }
+        if parts.is_empty() {
+            "none".into()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Touched {
+    target: ProcessRef,
+    original_priority: Option<PriorityClass>,
+    original_eco: Option<EcoQos>,
+    original_io: Option<IoPriority>,
+    original_memory: Option<MemoryPriority>,
+    actions: HashMap<Source, Vec<Action>>,
+    pending_restores: HashSet<Source>,
+    applied: Effective,
+}
+
+#[derive(Debug)]
+pub struct Executor {
+    dry_run: bool,
+    limiter: Limiter,
+    touched: HashMap<Key, Touched>,
+    events: EventLog,
+}
+
+fn key(t: &ProcessRef) -> Key {
+    (t.pid, t.create_time)
+}
+
+impl Executor {
+    pub fn new(dry_run: bool, events: EventLog) -> Self {
+        Self {
+            dry_run,
+            limiter: Limiter::new(),
+            touched: HashMap::new(),
+            events,
+        }
+    }
+
+    /// Switching to dry-run rolls back automatic (governor/rule) actions;
+    /// manual limits are kept.
+    pub fn set_dry_run(&mut self, dry_run: bool) {
+        if dry_run && !self.dry_run {
+            self.restore_sources(
+                &[
+                    Source::Governor,
+                    Source::Rule,
+                    Source::Insight,
+                    Source::GameMode,
+                ],
+                "dry-run enabled",
+            );
+        }
+        self.dry_run = dry_run;
+    }
+
+    pub fn managed(&self) -> Vec<Managed> {
+        let mut out: Vec<Managed> = self
+            .touched
+            .values()
+            .map(|t| Managed {
+                target: t.target.clone(),
+                sources: self.sources(&t.target),
+                summary: t.applied.summary(),
+            })
+            .collect();
+        out.sort_by_key(|m| m.target.pid);
+        out
+    }
+
+    /// Drops processes that are not in `live` (the running ones).
+    pub fn forget_exited(&mut self, live: &HashSet<Key>) {
+        let Self {
+            limiter, touched, ..
+        } = self;
+        touched.retain(|k, t| {
+            let alive = live.contains(k);
+            if !alive {
+                limiter.forget(&t.target);
+            } else if !t.pending_restores.is_empty()
+                && reconcile(limiter, t).is_ok()
+                && t.actions.is_empty()
+            {
+                return false;
+            }
+            alive
+        });
+        // Limits a failed lift left on a job: lifted again while the process
+        // runs, or nothing would ever take them off.
+        let leftover: Vec<ProcessRef> = limiter
+            .limited()
+            .filter(|r| {
+                touched
+                    .get(&key(r))
+                    .is_none_or(|t| t.applied.limits() == Limits::default())
+            })
+            .cloned()
+            .collect();
+        for r in leftover {
+            if live.contains(&key(&r)) {
+                let _ = limiter.lift(&r);
+            } else {
+                limiter.forget(&r);
+            }
+        }
+    }
+
+    pub fn execute(&mut self, decision: &Decision) -> Result<(), String> {
+        match decision {
+            Decision::Apply {
+                source,
+                target,
+                action,
+                reason,
+            } => {
+                if self.dry_run && *source != Source::Manual {
+                    self.events.info(
+                        Some(target),
+                        format!("dry-run: would apply {action} ({reason})"),
+                    );
+                    return Ok(());
+                }
+                self.apply(*source, target, *action, reason)
+            }
+            Decision::Restore {
+                source,
+                target,
+                reason,
+            } => {
+                if self.dry_run && *source != Source::Manual {
+                    self.events
+                        .info(Some(target), format!("dry-run: would restore ({reason})"));
+                    return Ok(());
+                }
+                self.restore(*source, target, reason)
+            }
+        }
+    }
+
+    fn apply(
+        &mut self,
+        source: Source,
+        t: &ProcessRef,
+        action: Action,
+        reason: &str,
+    ) -> Result<(), String> {
+        if source != Source::Manual
+            && matches!(action, Action::Kill | Action::Suspend)
+            && let Some(why) = wtm_core::automatic_end_blocked(&t.name)
+        {
+            let e = format!("{source:?}: {action} refused: {why} ({reason})");
+            self.events.warn(Some(t), e.clone());
+            return Err(e);
+        }
+        // Notify on terminations, memory relief, and when the governor first
+        // steps in on a process.
+        let mut notable = matches!(action, Action::Kill | Action::TrimMemory);
+        let result = if action == Action::TrimMemory {
+            // One-shot: nothing to track or roll back.
+            control::trim_memory(t).map_err(|e| e.to_string())
+        } else if action == Action::Kill {
+            let r = control::kill(t).map_err(|e| e.to_string());
+            if r.is_ok()
+                && let Some(entry) = self.touched.remove(&key(t))
+            {
+                self.limiter.forget(&entry.target);
+            }
+            r
+        } else {
+            // The originals are read when a setting is first taken (in `reconcile`).
+            let entry = self.touched.entry(key(t)).or_insert_with(|| Touched {
+                target: t.clone(),
+                original_priority: None,
+                original_eco: None,
+                original_io: None,
+                original_memory: None,
+                actions: HashMap::new(),
+                pending_restores: HashSet::new(),
+                applied: Effective::default(),
+            });
+            notable |= source == Source::Governor && !entry.actions.contains_key(&source);
+            // A newer action of the same kind from the same source replaces the old one.
+            let list = entry.actions.entry(source).or_default();
+            list.retain(|a| discriminant(a) != discriminant(&action));
+            list.push(action);
+            reconcile(&mut self.limiter, entry)
+        };
+
+        match &result {
+            Ok(()) if notable => self
+                .events
+                .notable(Some(t), format!("{source:?}: {action} ({reason})")),
+            Ok(()) => self
+                .events
+                .info(Some(t), format!("{source:?}: {action} ({reason})")),
+            Err(e) => self.events.warn(
+                Some(t),
+                format!("{source:?}: {action} failed: {e} ({reason})"),
+            ),
+        }
+        result
+    }
+
+    fn restore(&mut self, source: Source, t: &ProcessRef, reason: &str) -> Result<(), String> {
+        let k = key(t);
+        let Some(entry) = self.touched.get_mut(&k) else {
+            return Ok(());
+        };
+        if entry.actions.remove(&source).is_some() {
+            entry.pending_restores.insert(source);
+        } else if !entry.pending_restores.contains(&source) {
+            return Ok(());
+        }
+        let result = reconcile(&mut self.limiter, entry);
+        if result.is_ok() && entry.actions.is_empty() {
+            self.touched.remove(&k);
+        }
+        match &result {
+            Ok(()) => self
+                .events
+                .info(Some(t), format!("{source:?}: restored ({reason})")),
+            Err(e) => self.events.warn(
+                Some(t),
+                format!("{source:?}: restore incomplete: {e} ({reason})"),
+            ),
+        }
+        result
+    }
+
+    pub fn restore_sources(&mut self, sources: &[Source], reason: &str) {
+        let pending: Vec<(Source, ProcessRef)> = self
+            .touched
+            .values()
+            .flat_map(|t| {
+                sources
+                    .iter()
+                    .filter(|s| t.actions.contains_key(s) || t.pending_restores.contains(s))
+                    .map(|s| (*s, t.target.clone()))
+            })
+            .collect();
+        for (source, target) in pending {
+            let _ = self.restore(source, &target, reason);
+        }
+    }
+
+    /// The sources holding actions on `t`; empty when RustWTM does not
+    /// manage it.
+    pub fn sources(&self, t: &ProcessRef) -> Vec<Source> {
+        let mut sources: Vec<Source> = self
+            .touched
+            .get(&key(t))
+            .map(|e| {
+                e.actions
+                    .keys()
+                    .chain(&e.pending_restores)
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        sources.sort_by_key(|s| *s as u8);
+        sources.dedup();
+        sources
+    }
+
+    /// The user set the priority by hand: it becomes what a later rollback
+    /// returns to, so the governor letting go does not undo the user's choice.
+    pub fn manual_priority(&mut self, t: &ProcessRef, priority: PriorityClass) {
+        if let Some(entry) = self.touched.get_mut(&key(t)) {
+            entry.original_priority = Some(priority);
+        }
+    }
+
+    /// Like [`manual_priority`](Self::manual_priority), for efficiency mode.
+    pub fn manual_eco(&mut self, t: &ProcessRef, mode: EcoQos) {
+        if let Some(entry) = self.touched.get_mut(&key(t)) {
+            entry.original_eco = Some(mode);
+        }
+    }
+
+    /// Rolls back everything, from every source.
+    pub fn restore_all(&mut self, reason: &str) {
+        self.restore_sources(
+            &[
+                Source::Governor,
+                Source::Rule,
+                Source::Insight,
+                Source::GameMode,
+                Source::Manual,
+            ],
+            reason,
+        );
+        // Whatever an earlier lift could not take off.
+        for (t, r) in self.limiter.lift_all() {
+            match r {
+                Ok(()) => self
+                    .events
+                    .info(Some(&t), format!("limits lifted ({reason})")),
+                Err(e) => self.events.warn(
+                    Some(&t),
+                    format!("limits could not be lifted: {e} ({reason})"),
+                ),
+            }
+        }
+    }
+}
+
+/// Brings the process from `applied` to the fold of all requested actions.
+fn reconcile(limiter: &mut Limiter, t: &mut Touched) -> Result<(), String> {
+    let new = Effective::fold(t.actions.values().flatten());
+    let old = t.applied;
+    let target = &t.target;
+    let mut errors = Vec::new();
+
+    // What the process has when RustWTM takes a setting over is what a
+    // rollback returns to; an earlier touch for another reason (a cap) may
+    // predate a change made outside RustWTM.
+    let takes_priority = new.priority.is_some() && old.priority.is_none();
+    let takes_eco = new.eco_qos && !old.eco_qos;
+    let takes_io = new.io.is_some() && old.io.is_none();
+    let takes_memory = new.memory_priority.is_some() && old.memory_priority.is_none();
+    if (takes_priority || takes_eco || takes_io || takes_memory)
+        && let Ok(d) = control::inspect(target)
+    {
+        if takes_priority {
+            t.original_priority = d.priority.or(t.original_priority);
+        }
+        if takes_eco {
+            t.original_eco = d.eco_qos.or(t.original_eco);
+        }
+        if takes_io {
+            t.original_io = d.io_priority.or(t.original_io);
+        }
+        if takes_memory {
+            t.original_memory = d.memory_priority.or(t.original_memory);
+        }
+    }
+    if new.priority != old.priority {
+        let priority = new
+            .priority
+            .map(PriorityClass::from)
+            .or(t.original_priority);
+        if let Some(p) = priority {
+            match control::set_priority(target, p) {
+                Ok(()) => t.applied.priority = new.priority,
+                Err(e) => errors.push(e),
+            }
+        } else {
+            t.applied.priority = new.priority;
+        }
+    }
+    if new.eco_qos != old.eco_qos {
+        let mode = if new.eco_qos {
+            EcoQos::On
+        } else {
+            t.original_eco.unwrap_or(EcoQos::SystemManaged)
+        };
+        match control::set_eco_qos(target, mode) {
+            Ok(()) => t.applied.eco_qos = new.eco_qos,
+            Err(e) => errors.push(e),
+        }
+    }
+    if new.io != old.io {
+        // Back to what it had, or normal when that could not be read.
+        let io = new
+            .io
+            .map(IoPriority::from)
+            .unwrap_or(t.original_io.unwrap_or(IoPriority::Normal));
+        match control::set_io_priority(target, io) {
+            Ok(()) => t.applied.io = new.io,
+            Err(e) => errors.push(e),
+        }
+    }
+    if new.memory_priority != old.memory_priority {
+        let memory = new
+            .memory_priority
+            .map(MemoryPriority::from)
+            .unwrap_or(t.original_memory.unwrap_or(MemoryPriority::Normal));
+        match control::set_memory_priority(target, memory) {
+            Ok(()) => t.applied.memory_priority = new.memory_priority,
+            Err(e) => errors.push(e),
+        }
+    }
+    if new.limits() != old.limits() {
+        let r = if new.limits() != Limits::default() {
+            limiter.apply(target, new.limits())
+        } else if limiter.is_limited(target) {
+            limiter.lift(target)
+        } else {
+            // Applying failed earlier: there is nothing to lift.
+            Ok(())
+        };
+        match r {
+            Ok(()) => {
+                t.applied.cpu_cap = new.cpu_cap;
+                t.applied.memory_bytes = new.memory_bytes;
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    if new.suspended != old.suspended {
+        let r = if new.suspended {
+            control::suspend(target)
+        } else {
+            control::resume(target)
+        };
+        match r {
+            Ok(()) => t.applied.suspended = new.suspended,
+            Err(e) => errors.push(e),
+        }
+    }
+
+    // A failed field remains unapplied, so later requests retry it. Successful
+    // fields keep their state and original settings even on partial failure.
+    if errors.is_empty() {
+        t.pending_restores.clear();
+        Ok(())
+    } else {
+        Err(errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_restores_keep_their_state_and_retry_instead_of_succeeding() {
+        let target = ProcessRef {
+            pid: 4,
+            create_time: 0,
+            name: "System".into(),
+        };
+        let mut e = Executor::new(false, EventLog::default());
+        // State left by an applied priority; refusal is injected at the
+        // existing protection seam before any native operation is attempted.
+        e.touched.insert(
+            key(&target),
+            Touched {
+                target: target.clone(),
+                original_priority: Some(PriorityClass::Normal),
+                original_eco: None,
+                original_io: None,
+                original_memory: None,
+                actions: HashMap::from([(
+                    Source::Manual,
+                    vec![Action::Priority(PriorityLevel::Idle)],
+                )]),
+                pending_restores: HashSet::new(),
+                applied: Effective {
+                    priority: Some(PriorityLevel::Idle),
+                    ..Effective::default()
+                },
+            },
+        );
+        let restore = Decision::Restore {
+            source: Source::Manual,
+            target: target.clone(),
+            reason: "refusal fixture".into(),
+        };
+        for _ in 0..2 {
+            assert!(e.execute(&restore).is_err());
+            assert_eq!(e.sources(&target), [Source::Manual]);
+            assert_eq!(e.managed()[0].summary, "Idle");
+        }
+        e.forget_exited(&HashSet::from([key(&target)]));
+        assert_eq!(e.managed().len(), 1);
+        e.forget_exited(&HashSet::new());
+        assert!(e.managed().is_empty(), "exited targets require no rollback");
+    }
+
+    #[test]
+    fn failed_controls_are_retried_instead_of_reported_as_success() {
+        // A protected target gives deterministic refusal without changing it.
+        let target = ProcessRef {
+            pid: 4,
+            create_time: 0,
+            name: "System".into(),
+        };
+        let mut monitoring = Executor::new(true, EventLog::default());
+        let decision = |action| Decision::Apply {
+            source: Source::Manual,
+            target: target.clone(),
+            action,
+            reason: "bounded refusal proof".into(),
+        };
+        let mut control = decision(Action::CpuCap(10.0));
+        if let Decision::Apply { source, .. } = &mut control {
+            *source = Source::Governor;
+        }
+        assert!(
+            monitoring.execute(&control).is_ok(),
+            "control: monitoring logs without applying"
+        );
+        assert!(monitoring.managed().is_empty());
+        for action in [
+            Action::CpuCap(10.0),
+            Action::Priority(PriorityLevel::Idle),
+            Action::EcoQos,
+            Action::Suspend,
+        ] {
+            let mut executor = Executor::new(false, EventLog::default());
+            assert!(
+                executor.execute(&decision(action)).is_err(),
+                "protected target must refuse {action:?}"
+            );
+            let repeated = executor.execute(&decision(action));
+            eprintln!("EXPECTED: repeated {action:?} returns Err; ACTUAL: {repeated:?}");
+            assert!(
+                repeated.is_err(),
+                "failed controls must not become an apparent success on retry"
+            );
+            assert_eq!(
+                executor.managed()[0].summary,
+                "none",
+                "refused controls must not be advertised as applied"
+            );
+        }
+    }
+
+    #[test]
+    fn fold_takes_the_most_restrictive_state() {
+        let governor = [
+            Action::Priority(PriorityLevel::BelowNormal),
+            Action::CpuCap(20.0),
+        ];
+        let rule = [
+            Action::Priority(PriorityLevel::Idle),
+            Action::CpuCap(50.0),
+            Action::EcoQos,
+            Action::MemoryCapMb(512),
+        ];
+        let e = Effective::fold(governor.iter().chain(&rule));
+        assert_eq!(e.priority, Some(PriorityLevel::Idle));
+        assert_eq!(e.cpu_cap, Some(20.0));
+        assert_eq!(e.memory_bytes, Some(512 << 20));
+        assert!(e.eco_qos && !e.suspended);
+        assert_eq!(
+            e.summary(),
+            "Idle, efficiency mode, CPU ≤ 20.00%, memory ≤ 512 MiB"
+        );
+
+        // Governor rolls back: the rule's limits remain.
+        let e = Effective::fold(&rule);
+        assert_eq!(e.priority, Some(PriorityLevel::Idle));
+        assert_eq!(e.cpu_cap, Some(50.0));
+        assert_eq!(Effective::fold(&[]).summary(), "none");
+
+        // Kill and relative caps are resolved before they reach the executor.
+        let e = Effective::fold(&[Action::Kill, Action::CpuCapRelative(0.5), Action::Suspend]);
+        assert_eq!(e.limits(), Limits::default());
+        assert_eq!(e.summary(), "suspended");
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use wtm_core::Sampler;
+
+    use crate::test_util::wait_for;
+
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn spawn() -> (Guard, ProcessRef) {
+        // Wrapped at once so the child is reaped on every path.
+        let child = Guard(
+            Command::new("cmd.exe")
+                .raw_arg("/d /c ping -n 60 127.0.0.1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let t = wait_for("child sampled", || {
+            let snap = Sampler::new().sample().unwrap();
+            snap.processes.iter().find(|p| p.pid == pid).map(Into::into)
+        });
+        (child, t)
+    }
+
+    #[test]
+    fn limits_left_by_a_failed_lift_are_lifted_on_the_next_tick() {
+        let (_child, t) = spawn();
+        let mut e = Executor::new(false, EventLog::default());
+        // As a lift that failed leaves it: the job still limits the process,
+        // and nothing the executor tracks wants that any more.
+        e.limiter
+            .apply(
+                &t,
+                Limits {
+                    cpu_percent: Some(50.0),
+                    memory_bytes: None,
+                },
+            )
+            .unwrap();
+        e.forget_exited(&HashSet::from([key(&t)]));
+        assert!(!e.limiter.is_limited(&t));
+    }
+
+    #[test]
+    fn policies_never_end_or_suspend_service_hosts() {
+        let mut e = Executor::new(false, EventLog::default());
+        // A made-up PID: nothing may even be attempted.
+        let t = ProcessRef {
+            pid: 0xffff_fff1,
+            create_time: 1,
+            name: "svchost.exe".into(),
+        };
+        for action in [Action::Kill, Action::Suspend] {
+            let err = apply(&mut e, Source::Rule, &t, action).unwrap_err();
+            assert!(err.contains("hosts Windows services"), "{err}");
+        }
+        // Throttling it is still allowed (and fails here only on the PID).
+        let err = apply(&mut e, Source::Rule, &t, Action::EcoQos).unwrap_err();
+        assert!(!err.contains("hosts Windows services"), "{err}");
+    }
+
+    fn apply(
+        e: &mut Executor,
+        source: Source,
+        t: &ProcessRef,
+        action: Action,
+    ) -> Result<(), String> {
+        e.execute(&Decision::Apply {
+            source,
+            target: t.clone(),
+            action,
+            reason: "test".into(),
+        })
+    }
+
+    fn restore(e: &mut Executor, source: Source, t: &ProcessRef) -> Result<(), String> {
+        e.execute(&Decision::Restore {
+            source,
+            target: t.clone(),
+            reason: "test".into(),
+        })
+    }
+
+    fn priority(t: &ProcessRef) -> Option<PriorityClass> {
+        control::inspect(t).unwrap().priority
+    }
+
+    #[test]
+    fn sources_compose_and_roll_back_independently() {
+        let (_child, t) = spawn();
+        // Inherited from the test runner (BelowNormal on some CI machines).
+        let original = priority(&t);
+        let events = EventLog::default();
+        let mut e = Executor::new(false, events.clone());
+
+        apply(
+            &mut e,
+            Source::Governor,
+            &t,
+            Action::Priority(PriorityLevel::BelowNormal),
+        )
+        .unwrap();
+        apply(
+            &mut e,
+            Source::Rule,
+            &t,
+            Action::Priority(PriorityLevel::Idle),
+        )
+        .unwrap();
+        apply(&mut e, Source::Rule, &t, Action::EcoQos).unwrap();
+        apply(&mut e, Source::Manual, &t, Action::CpuCap(50.0)).unwrap();
+        assert_eq!(priority(&t), Some(PriorityClass::Idle));
+        assert_eq!(control::inspect(&t).unwrap().eco_qos, Some(EcoQos::On));
+
+        let managed = e.managed();
+        assert_eq!(managed.len(), 1);
+        assert_eq!(
+            managed[0].sources,
+            [Source::Governor, Source::Rule, Source::Manual]
+        );
+        assert!(managed[0].summary.contains("Idle"), "{managed:?}");
+
+        // The governor rolling back keeps the rule's stricter priority.
+        restore(&mut e, Source::Governor, &t).unwrap();
+        assert_eq!(priority(&t), Some(PriorityClass::Idle));
+        // Rule gone: back to the original priority; eco reverts.
+        restore(&mut e, Source::Rule, &t).unwrap();
+        assert_eq!(priority(&t), original);
+        assert_eq!(
+            control::inspect(&t).unwrap().eco_qos,
+            Some(EcoQos::SystemManaged)
+        );
+        // Restoring a source that never acted is a no-op.
+        restore(&mut e, Source::Insight, &t).unwrap();
+
+        e.restore_all("test end");
+        assert!(e.managed().is_empty());
+        assert!(
+            events
+                .after(0)
+                .iter()
+                .any(|ev| ev.message.contains("restored"))
+        );
+    }
+
+    #[test]
+    fn io_and_memory_priorities_take_the_lowest_and_roll_back() {
+        let (_child, t) = spawn();
+        let io = || control::inspect(&t).unwrap().io_priority;
+        let memory = || control::inspect(&t).unwrap().memory_priority;
+        let (original_io, original_memory) = (io(), memory());
+        println!("EXPECTED: normal before; ACTUAL: {original_io:?} {original_memory:?}");
+        let mut e = Executor::new(false, EventLog::default());
+
+        apply(
+            &mut e,
+            Source::Governor,
+            &t,
+            Action::IoPriority(IoLevel::Low),
+        )
+        .unwrap();
+        apply(
+            &mut e,
+            Source::Rule,
+            &t,
+            Action::IoPriority(IoLevel::VeryLow),
+        )
+        .unwrap();
+        apply(
+            &mut e,
+            Source::Rule,
+            &t,
+            Action::MemoryPriority(MemoryLevel::Low),
+        )
+        .unwrap();
+        assert_eq!(io(), Some(IoPriority::Background));
+        assert_eq!(memory(), Some(MemoryPriority::Low));
+        let summary = &e.managed()[0].summary;
+        assert!(
+            summary.contains("I/O priority very low") && summary.contains("memory priority low"),
+            "{summary}"
+        );
+
+        // The rule letting go leaves the governor's (higher) I/O priority.
+        restore(&mut e, Source::Rule, &t).unwrap();
+        assert_eq!(io(), Some(IoPriority::Low));
+        assert_eq!(memory(), original_memory);
+        restore(&mut e, Source::Governor, &t).unwrap();
+        assert_eq!(io(), original_io);
+        assert!(e.managed().is_empty());
+    }
+
+    #[test]
+    fn manual_changes_survive_rollbacks() {
+        let (_child, t) = spawn();
+        let mut e = Executor::new(false, EventLog::default());
+        // Nothing managed: manual changes have nothing to update.
+        e.manual_priority(&t, PriorityClass::High);
+        assert!(e.sources(&t).is_empty());
+
+        apply(
+            &mut e,
+            Source::Governor,
+            &t,
+            Action::Priority(PriorityLevel::Idle),
+        )
+        .unwrap();
+        apply(&mut e, Source::Governor, &t, Action::EcoQos).unwrap();
+        assert_eq!(e.sources(&t), [Source::Governor]);
+        // The user picks a priority and turns efficiency mode off meanwhile.
+        control::set_priority(&t, PriorityClass::AboveNormal).unwrap();
+        e.manual_priority(&t, PriorityClass::AboveNormal);
+        control::set_eco_qos(&t, EcoQos::Off).unwrap();
+        e.manual_eco(&t, EcoQos::Off);
+        // The governor letting go keeps the user's choice.
+        restore(&mut e, Source::Governor, &t).unwrap();
+        assert_eq!(priority(&t), Some(PriorityClass::AboveNormal));
+        assert_eq!(control::inspect(&t).unwrap().eco_qos, Some(EcoQos::Off));
+        assert!(e.sources(&t).is_empty());
+    }
+
+    #[test]
+    fn a_cap_that_failed_to_apply_rolls_back_cleanly() {
+        let system = ProcessRef {
+            pid: 4,
+            create_time: 0,
+            name: "System".into(),
+        };
+        let mut e = Executor::new(false, EventLog::default());
+        assert!(apply(&mut e, Source::Rule, &system, Action::CpuCap(10.0)).is_err());
+        // Only the restore itself is checked: no "not limited" complaint.
+        restore(&mut e, Source::Rule, &system).unwrap();
+        assert!(e.managed().is_empty());
+    }
+
+    #[test]
+    fn failed_restores_recover_on_live_ticks_and_preserve_other_sources() {
+        for other in [false, true] {
+            for tick in [false, true] {
+                let (_child, target) = spawn();
+                let original = priority(&target);
+                let mut e = Executor::new(false, EventLog::default());
+                apply(
+                    &mut e,
+                    Source::Governor,
+                    &target,
+                    Action::Priority(PriorityLevel::Idle),
+                )
+                .unwrap();
+                if other {
+                    apply(
+                        &mut e,
+                        Source::Manual,
+                        &target,
+                        Action::Priority(PriorityLevel::BelowNormal),
+                    )
+                    .unwrap();
+                }
+                // Inject refusal after the real change on this owned child.
+                e.touched.get_mut(&key(&target)).unwrap().target.name = "System".into();
+                assert!(restore(&mut e, Source::Governor, &target).is_err());
+                assert!(restore(&mut e, Source::Governor, &target).is_err());
+                assert_eq!(priority(&target), Some(PriorityClass::Idle));
+                e.touched.get_mut(&key(&target)).unwrap().target = target.clone();
+                if tick {
+                    e.forget_exited(&HashSet::from([key(&target)]));
+                } else {
+                    e.restore_sources(&[Source::Governor], "retry");
+                }
+                assert_eq!(
+                    priority(&target),
+                    if other {
+                        Some(PriorityClass::BelowNormal)
+                    } else {
+                        original
+                    }
+                );
+                assert_eq!(
+                    e.sources(&target),
+                    if other { vec![Source::Manual] } else { vec![] }
+                );
+                e.restore_all("cleanup");
+                assert_eq!(priority(&target), original);
+                assert!(e.managed().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_kill_keeps_the_live_process_available_for_rollback() {
+        let (_child, target) = spawn();
+        let original = priority(&target);
+        let mut e = Executor::new(false, EventLog::default());
+        apply(
+            &mut e,
+            Source::Manual,
+            &target,
+            Action::Priority(PriorityLevel::Idle),
+        )
+        .unwrap();
+        let mut refused = target.clone();
+        // Deterministic failure at the existing protection seam, before kill.
+        refused.name = "System".into();
+        for _ in 0..2 {
+            assert!(apply(&mut e, Source::Manual, &refused, Action::Kill).is_err());
+            assert_eq!(e.sources(&target), [Source::Manual]);
+        }
+        e.restore_all("after failed kill");
+        assert_eq!(priority(&target), original);
+        assert!(e.managed().is_empty());
+    }
+
+    #[test]
+    fn suspend_memory_cap_and_kill() {
+        let (mut child, t) = spawn();
+        let mut e = Executor::new(false, EventLog::default());
+        apply(&mut e, Source::Rule, &t, Action::Suspend).unwrap();
+        apply(&mut e, Source::Rule, &t, Action::MemoryCapMb(512)).unwrap();
+        assert!(e.managed()[0].summary.contains("suspended"));
+        restore(&mut e, Source::Rule, &t).unwrap();
+        assert!(e.managed().is_empty());
+
+        apply(
+            &mut e,
+            Source::Governor,
+            &t,
+            Action::Priority(PriorityLevel::Idle),
+        )
+        .unwrap();
+        let events = e.events.clone();
+        apply(&mut e, Source::Rule, &t, Action::Kill).unwrap();
+        assert_eq!(child.0.wait().unwrap().code(), Some(1));
+        assert!(e.managed().is_empty(), "kill forgets the process");
+        assert!(
+            events.after(0).iter().any(|ev| ev.notify),
+            "kill is notable"
+        );
+    }
+
+    #[test]
+    fn dry_run_logs_only_and_switching_rolls_back() {
+        let (_child, t) = spawn();
+        let original = priority(&t);
+        let events = EventLog::default();
+        let mut e = Executor::new(true, events.clone());
+        apply(
+            &mut e,
+            Source::Governor,
+            &t,
+            Action::Priority(PriorityLevel::Idle),
+        )
+        .unwrap();
+        restore(&mut e, Source::Governor, &t).unwrap();
+        assert_eq!(priority(&t), original);
+        assert!(
+            events
+                .after(0)
+                .iter()
+                .any(|ev| ev.message.starts_with("dry-run: would apply"))
+        );
+        assert!(
+            events
+                .after(0)
+                .iter()
+                .any(|ev| ev.message.starts_with("dry-run: would restore"))
+        );
+
+        // Manual actions run even in dry-run.
+        apply(
+            &mut e,
+            Source::Manual,
+            &t,
+            Action::Priority(PriorityLevel::BelowNormal),
+        )
+        .unwrap();
+        assert_eq!(priority(&t), Some(PriorityClass::BelowNormal));
+
+        // Enforcing, then back to dry-run: automatic sources roll back, manual stays.
+        e.set_dry_run(false);
+        apply(
+            &mut e,
+            Source::Rule,
+            &t,
+            Action::Priority(PriorityLevel::Idle),
+        )
+        .unwrap();
+        assert_eq!(priority(&t), Some(PriorityClass::Idle));
+        e.set_dry_run(true);
+        assert_eq!(priority(&t), Some(PriorityClass::BelowNormal));
+        assert_eq!(e.managed()[0].sources, [Source::Manual]);
+    }
+
+    #[test]
+    fn restoring_an_exited_process_is_reported_as_incomplete() {
+        let (child, t) = spawn();
+        let events = EventLog::default();
+        let mut e = Executor::new(false, events.clone());
+        apply(
+            &mut e,
+            Source::Manual,
+            &t,
+            Action::Priority(PriorityLevel::Idle),
+        )
+        .unwrap();
+        // Gone before the original priority can be put back. The process
+        // object can outlive the exit while others still hold handles.
+        drop(child);
+        wait_for("process object gone", || {
+            control::inspect(&t).is_err().then_some(())
+        });
+        let err = restore(&mut e, Source::Manual, &t).unwrap_err();
+        assert!(!err.is_empty());
+        assert_eq!(e.managed().len(), 1, "failed rollback remains pending");
+        e.forget_exited(&HashSet::new());
+        assert!(
+            e.managed().is_empty(),
+            "the next snapshot drops exited targets"
+        );
+        assert!(
+            events
+                .after(0)
+                .iter()
+                .any(|ev| ev.message.starts_with("Manual: restore incomplete"))
+        );
+    }
+
+    #[test]
+    fn exited_processes_are_forgotten_and_failures_reported() {
+        let (child, t) = spawn();
+        let mut e = Executor::new(false, EventLog::default());
+        apply(&mut e, Source::Manual, &t, Action::CpuCap(20.0)).unwrap();
+        drop(child);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let live = Sampler::new()
+            .sample()
+            .unwrap()
+            .processes
+            .iter()
+            .map(|p| (p.pid, p.create_time))
+            .collect();
+        e.forget_exited(&live);
+        assert!(e.managed().is_empty());
+
+        // A protected process is refused and the failure is reported.
+        let system = ProcessRef {
+            pid: 4,
+            create_time: 0,
+            name: "System".into(),
+        };
+        assert!(
+            apply(
+                &mut e,
+                Source::Manual,
+                &system,
+                Action::Priority(PriorityLevel::Idle)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn trim_memory_is_one_shot_and_announced() {
+        let (_child, t) = spawn();
+        let events = EventLog::default();
+        let mut e = Executor::new(false, events.clone());
+        apply(&mut e, Source::MemoryGuard, &t, Action::TrimMemory).unwrap();
+        assert!(e.managed().is_empty(), "nothing to roll back");
+        let log = events.after(0);
+        assert!(
+            log.iter()
+                .any(|ev| ev.notify && ev.message.contains("trim memory")),
+            "{log:?}"
+        );
+        let system = ProcessRef {
+            pid: 4,
+            create_time: 0,
+            name: "System".into(),
+        };
+        assert!(apply(&mut e, Source::MemoryGuard, &system, Action::TrimMemory).is_err());
+    }
+}

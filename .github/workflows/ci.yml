@@ -1,0 +1,361 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push supersedes older runs of the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Docs
+        run: cargo doc --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Test
+        # A normal run takes minutes; a stuck test must not hold the job for hours.
+        timeout-minutes: 30
+        run: cargo test --workspace
+        env:
+          # The runner is an elevated, disposable VM: also exercise service
+          # install / uninstall, from the build folder.
+          RUSTWTM_SCM_TESTS: '1'
+          RUSTWTM_ALLOW_ANY_INSTALL_DIR: '1'
+
+      - name: Telegram build profiles
+        shell: pwsh
+        run: |
+          cargo test --locked -p wtm-service --no-default-features ipc_server::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked -p wtm-service -p wtm-gui --all-targets --features telegram-control -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p wtm-service --features telegram-control telegram::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p wtm-gui --features telegram-control telegram_settings::tests
+
+      - name: Hardware provider and watchdog checks
+        shell: pwsh
+        run: scripts/build-hardware.ps1
+
+      - name: Lint PowerShell scripts
+        shell: pwsh
+        run: |
+          foreach ($f in Get-ChildItem scripts -Recurse -Filter *.ps1) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors)
+            if ($errors) { $errors | ForEach-Object { Write-Error "$($f.Name): $($_.Message)" }; exit 1 }
+          }
+
+      - name: Signature verification controls
+        shell: pwsh
+        run: scripts/ci/test-signatures.ps1
+
+      - name: Transfer-safe release discovery controls
+        shell: pwsh
+        run: scripts/ci/test-release-discovery.ps1
+
+      - name: Installer lifecycle controls
+        shell: pwsh
+        run: scripts/ci/test-install-lifecycle.ps1
+
+      - name: Website package publication controls
+        run: python scripts/ci/test-publish-website-media.py
+
+  coverage:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: |
+          rustup show
+          rustup component add llvm-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Coverage
+        env:
+          RUSTWTM_SCM_TESTS: '1'
+          RUSTWTM_ALLOW_ANY_INSTALL_DIR: '1'
+        shell: pwsh
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path lcov.info
+          $summary = cargo llvm-cov report --summary-only
+          "## Test coverage`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          '```' | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          $summary | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          '```' | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: lcov
+          path: lcov.info
+
+  # The runner is an elevated, disposable VM: install for real and verify.
+  msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          ./scripts/build-hardware.ps1
+          dotnet tool restore
+          dotnet wix extension add WixToolset.Util.wixext/5.0.2
+          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          dotnet wix build installer/RustWTM.wxs -ext WixToolset.Util.wixext -arch x64 -d Version=$version -d BinDir=target/debug -o dist/RustWTM-test.msi
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Install, verify, uninstall
+        shell: pwsh
+        run: scripts/ci/verify-install.ps1 -Mode msi -Msi dist/RustWTM-test.msi
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: installer-under-test
+          path: dist/RustWTM-test.msi
+          if-no-files-found: error
+
+      - name: Collect installer diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path installer-diagnostics/service -Force | Out-Null
+          Get-ChildItem -Path . -Filter *.log -File | Copy-Item -Destination installer-diagnostics
+          if (Test-Path -LiteralPath C:/ProgramData/RustWTM/logs) {
+            Get-ChildItem -LiteralPath C:/ProgramData/RustWTM/logs -File | Copy-Item -Destination installer-diagnostics/service
+          }
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: msi-logs
+          path: installer-diagnostics/
+
+  upgrade:
+    name: upgrade (${{ matrix.baseline }})
+    needs: msi
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - baseline: '0.25.0'
+            sha256: '6612ebe0b5912a8d04aaca50effdf77b3f62c7f2a7ca4b8aaed324cc875f8629'
+          - baseline: '0.26.1'
+            sha256: '3b606894528a0eb1628205e012757dd6e748169b7aafd9ac865f1193d0f41cba'
+          - baseline: '0.27.2'
+            sha256: 'e9910d9a9320b2ff2b5f10d44d52d62ca5074ccd091941b3139ef0bae7a8de9e'
+          - baseline: '0.28.0'
+            sha256: '89e3d5183acda95485dd40aeec74d9beb4800bee3abe5ec632b2f2898bc376e4'
+          - baseline: '0.29.0'
+            sha256: 'd299964d54eda468a3e5137071866b1453e01cc8d5c2eaefb475107a9bf8e82a'
+          - baseline: '0.30.0'
+            sha256: '21c77312446e3b2b91b8d7932d5bd6ecb8cc2336455cab751360416c170b3ea5'
+          - baseline: '0.30.1'
+            sha256: '332d81abdc51c211543175f6f52d37e0df01cab5f8b59fc03ab95954042cd150'
+          - baseline: '0.30.4'
+            sha256: '6e3be997b66bd7ce174df430fb56c6219cf00055fc8b60116a4a167bc3a1db56'
+          - baseline: '0.31.0'
+            sha256: '3b58a030afd291360bbeac29313e9db95352582e823baf6b4cabadacd57e9996'
+          - baseline: '0.32.0'
+            sha256: 'e38400f121a66df36461c341a0d4d42c30af589af36efff4e3f5d565058a355e'
+          - baseline: '0.33.0'
+            sha256: 'c4f93b520e06f39db3e96e2bb17271d509a4a20a38e69ae903e3a3dc4cd6ce68'
+          - baseline: '0.34.0'
+            sha256: 'a6fbffeb1734cfdc68faf8ab3e8b97a87dd642168d48b928d146b97b49c30b49'
+          - baseline: '0.35.0'
+            sha256: '873c8cbaa66368c63ba0a171dd075a88b7853017d9a3b8a198a4eed5b961888f'
+          - baseline: '0.36.0'
+            sha256: '87067b477705e156e2d1befa9b650b75ec1532d8f3420a5c6784d359e2de6494'
+          - baseline: '0.36.1'
+            sha256: '84709fc839f5eaa7fe4ef9399e2b665e73f040d48a0af6ed4a4fd140f6125f53'
+          - baseline: '0.36.2'
+            sha256: '511243f968249dc036d7f3c52a7cfde5261663cd96bd6cc4953d01f3501b3ba1'
+          - baseline: '0.36.3'
+            sha256: 'd01a208f03ee6a9aef55feeeacdfe5f93ace38f5af5d87facdd86bd93c321998'
+          - baseline: '0.36.4'
+            sha256: '1112c51a86133681afb8b1c407f12b292ccdb99e4cac96e77f8fd36f89f135b3'
+          - baseline: '0.37.0'
+            sha256: '4e20ede6ba04801c5864ed75219932942d3af78655d7ce25936379fef9f29741'
+          - baseline: '0.37.1'
+            sha256: 'd1b976f2613f99daa5e70e43a8cdfa9d720b983d551f56fee4b267fe8b814527'
+    env:
+      BASELINE_VERSION: ${{ matrix.baseline }}
+      BASELINE_SHA256: ${{ matrix.sha256 }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: installer-under-test
+          path: dist
+      - name: Download pinned upgrade baseline
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = "RustWTM-${env:BASELINE_VERSION}-x64.msi"
+          gh release download "v${env:BASELINE_VERSION}" --repo "$env:GITHUB_REPOSITORY" --pattern $asset --dir dist/baseline
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $actual = (Get-FileHash (Join-Path dist/baseline $asset) -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -cne $env:BASELINE_SHA256) { throw 'Upgrade baseline digest mismatch' }
+
+      - name: Upgrade, repair, reject downgrade, preserve data
+        shell: pwsh
+        env:
+          RUSTWTM_DISPOSABLE_INSTALL_TESTS: '1'
+        run: |
+          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          $baseline = "dist/baseline/RustWTM-${env:BASELINE_VERSION}-x64.msi"
+          scripts/ci/verify-upgrade.ps1 -BaselineMsi $baseline -CandidateMsi dist/RustWTM-test.msi -BaselineVersion $env:BASELINE_VERSION -CandidateVersion $version -DisposableMachine
+
+      - name: Collect upgrade diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path upgrade-diagnostics -Force | Out-Null
+          Get-ChildItem -Path . -Filter *.log -File | Copy-Item -Destination upgrade-diagnostics
+          if (Test-Path -LiteralPath C:/ProgramData/RustWTM/logs) {
+            Get-ChildItem -LiteralPath C:/ProgramData/RustWTM/logs -File | Copy-Item -Destination upgrade-diagnostics
+          }
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: failure()
+        with:
+          name: upgrade-logs-${{ matrix.baseline }}
+          path: upgrade-diagnostics/
+
+  install-script:
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build locked release
+        run: cargo build --locked --release --workspace
+
+      - name: Install from source, verify, uninstall
+        shell: pwsh
+        run: scripts/ci/verify-install.ps1 -Mode script
+
+      - name: Collect installer diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path installer-diagnostics/service -Force | Out-Null
+          Get-ChildItem -Path . -Filter *.log -File | Copy-Item -Destination installer-diagnostics
+          if (Test-Path -LiteralPath C:/ProgramData/RustWTM/logs) {
+            Get-ChildItem -LiteralPath C:/ProgramData/RustWTM/logs -File | Copy-Item -Destination installer-diagnostics/service
+          }
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: install-script-logs
+          path: installer-diagnostics/
+
+  visual:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      WGPU_BACKEND: dx12
+      WTM_REVIEW_LANGS: en,tr,de,fr,es
+      WTM_REVIEW_TABS: Overview,Processes,Performance,Containers,Disks,Settings,Hardware,InstalledApps
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2
+      - name: Render gauge DPI gallery
+        run: cargo test --locked -p wtm-gui --features visual-tests -j 2 render_gauge_review -- --test-threads=1 --nocapture
+      - name: Render localized product screens
+        run: cargo test --locked -p wtm-gui --features visual-tests -j 2 render_release_review -- --test-threads=1 --nocapture
+      - name: Render device dashboards
+        env:
+          WTM_EXPANSION_LANGS: en
+          WTM_EXPANSION_CASES: light:wide:gpu,light:compact:disk-details,dark:wide:disk-details,dark:compact:memory
+        run: cargo test --locked -p wtm-gui --features visual-tests -j 2 render_product_expansion_review -- --test-threads=1 --nocapture
+      - name: Render quick setup and retry feedback
+        run: cargo test --locked -p wtm-gui --features visual-tests -j 2 render_onboarding -- --ignored --test-threads=1 --nocapture
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: visual-review
+          path: |
+            target/visual-review
+            target/product-expansion-review
+            target/onboarding-review
+            target/onboarding-error-review
+          if-no-files-found: warn
+
+  artifact-provenance:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: msi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: installer-under-test
+          path: dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.msi
+      - name: Verify exact CI artifact provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh attestation verify dist/RustWTM-test.msi
+          --repo "$GITHUB_REPOSITORY"
+          --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml"
+          --source-digest "$GITHUB_SHA"
+          --deny-self-hosted-runners

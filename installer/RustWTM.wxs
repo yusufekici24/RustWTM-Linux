@@ -1,0 +1,190 @@
+<!--
+  RustWTM MSI package (WiX Toolset 5).
+
+  Build after a release build of the workspace:
+    pwsh scripts/build-hardware.ps1 -OutputDir target/release/hardware
+    dotnet tool restore
+    dotnet wix extension add WixToolset.Util.wixext/5.0.2
+    dotnet wix build installer/RustWTM.wxs -ext WixToolset.Util.wixext -arch x64 -d Version=0.26.1 -d BinDir=target/release -o dist/RustWTM-0.26.1-x64.msi
+  (XML comments cannot contain two consecutive hyphens, hence no flags here.)
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="RustWTM"
+           Manufacturer="OXOGNET OÜ"
+           Version="$(Version)"
+           UpgradeCode="31A0E74F-195E-4454-8EFF-60024395D197"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of RustWTM is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="RustWTM.ico" SourceFile="assets\rustwtm.ico" />
+    <Property Id="ARPPRODUCTICON" Value="RustWTM.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://rustwtm.com" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/rustwtm/rustwtm/issues" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RustWTM">
+
+        <Component Id="Gui">
+          <File Id="GuiExe" Source="$(BinDir)\rustwtm.exe" KeyPath="yes" />
+        </Component>
+
+        <Directory Id="HardwareFolder" Name="hardware">
+          <Component Id="HardwareProvider">
+            <File Id="HardwareProviderExe" Source="$(BinDir)\hardware\wtm-hardware.exe" KeyPath="yes" />
+            <File Id="HardwareProviderNotices" Source="$(BinDir)\hardware\PROVIDER-NOTICES.txt" />
+            <File Id="HardwareMonoPosixHelper" Source="$(BinDir)\hardware\MonoPosixHelper.dll" />
+            <File Id="HardwareLibMonoPosixHelper" Source="$(BinDir)\hardware\libMonoPosixHelper.dll" />
+          </Component>
+        </Directory>
+
+        <Directory Id="DocumentationFolder" Name="docs">
+          <Component Id="HardwareDocumentation">
+            <File Id="HardwareGuide" Source="docs\hardware.md" KeyPath="yes" />
+          </Component>
+          <Component Id="CpuDocumentation">
+            <File Id="CpuGuide" Source="docs\cpu-controls.md" KeyPath="yes" />
+          </Component>
+          <Component Id="DockerDocumentation">
+            <File Id="DockerGuide" Source="docs\docker.md" KeyPath="yes" />
+          </Component>
+          <Component Id="TaskManagerDocumentation">
+            <File Id="TaskManagerGuide" Source="docs\task-manager.md" KeyPath="yes" />
+          </Component>
+          <Component Id="LanguageDocumentation">
+            <File Id="LanguageGuide" Source="docs\localization.md" KeyPath="yes" />
+          </Component>
+          <Component Id="InstallationDocumentation">
+            <File Id="InstallationGuide" Source="docs\installation.md" KeyPath="yes" />
+          </Component>
+          <Component Id="UsageDocumentation">
+            <File Id="UsageGuide" Source="docs\usage.md" KeyPath="yes" />
+          </Component>
+          <Component Id="ConfigurationDocumentation">
+            <File Id="ConfigurationGuide" Source="docs\configuration.md" KeyPath="yes" />
+          </Component>
+          <Component Id="MemoryGuardDocumentation">
+            <File Id="MemoryGuardGuide" Source="docs\memory-guard.md" KeyPath="yes" />
+          </Component>
+          <Component Id="TelegramDocumentation">
+            <File Id="TelegramGuide" Source="docs\telegram.md" KeyPath="yes" />
+          </Component>
+        </Directory>
+
+        <Component Id="Cli">
+          <File Id="CliExe" Source="$(BinDir)\wtm.exe" KeyPath="yes" />
+        </Component>
+
+        <Component Id="Service">
+          <File Id="ServiceExe" Source="$(BinDir)\wtm-service.exe" KeyPath="yes" />
+          <ServiceInstall Id="RustWTMService"
+                          Name="RustWTM"
+                          DisplayName="RustWTM Governor"
+                          Description="Keeps the system responsive by throttling processes that overload the CPU."
+                          Type="ownProcess"
+                          Start="auto"
+                          ErrorControl="normal"
+                          Account="LocalSystem"
+                          Arguments="service">
+            <!-- Restart on failure; reset the failure count after a day. -->
+            <util:ServiceConfig FirstFailureActionType="restart"
+                                SecondFailureActionType="restart"
+                                ThirdFailureActionType="restart"
+                                RestartServiceDelayInSeconds="5"
+                                ResetPeriodInDays="1" />
+          </ServiceInstall>
+          <!-- Stopping the service rolls back every limit it applied. -->
+          <ServiceControl Id="RustWTMServiceControl" Name="RustWTM" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+
+        <Component Id="Readme">
+          <File Id="ReadmeFile" Source="README.md" KeyPath="yes" />
+        </Component>
+        <Component Id="License">
+          <File Id="LicenseFile" Source="LICENSE" KeyPath="yes" />
+        </Component>
+        <Component Id="Changelog">
+          <File Id="ChangelogFile" Source="CHANGELOG.md" KeyPath="yes" />
+        </Component>
+
+        <Component Id="PathEntry">
+          <Environment Id="PathAppend" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="yes" />
+          <RegistryValue Root="HKLM" Key="Software\RustWTM" Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        </Component>
+
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut">
+        <Shortcut Id="GuiShortcut"
+                  Name="RustWTM"
+                  Description="RustWTM task manager"
+                  Target="[INSTALLFOLDER]rustwtm.exe"
+                  Icon="RustWTM.ico"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKLM" Key="Software\RustWTM" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <!-- The tray app holds rustwtm.exe open; ask it to quit (WM_CLOSE, then
+         WM_QUERYENDSESSION/WM_ENDSESSION, sent from the user's context)
+         before files are removed or replaced, so an upgrade or uninstall
+         needs no reboot. The util extension schedules this before
+         InstallFiles, which on uninstall (and on the removal of this
+         version by a later upgrade) comes after RemoveFiles: moved to just
+         before cleanup and RemoveFiles, still inside the script phase it needs.
+         Close first so the window cannot save a new replacement after cleanup. -->
+    <util:CloseApplication Id="CloseGui"
+                           Target="rustwtm.exe"
+                           CloseMessage="yes"
+                           EndSessionMessage="yes"
+                           RebootPrompt="no" />
+
+    <!-- On a full uninstall (not an upgrade), remove the blocked-program
+         entries and firewall rules RustWTM made: the entries would keep
+         sending blocked programs to a deleted rustwtm.exe. Runs as SYSTEM
+         after the service stopped and before its files go. A cleanup failure
+         keeps installation files so an owned Task Manager redirect cannot
+         point to a deleted program. -->
+    <CustomAction Id="RustWTMCleanup"
+                  FileRef="ServiceExe"
+                  ExeCommand="cleanup"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="override Wix4CloseApplications_$(sys.BUILDARCHSHORT)"
+              Before="RustWTMCleanup"
+              Condition="VersionNT &gt; 400" />
+      <Custom Action="RustWTMCleanup"
+              Before="RemoveFiles"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <Feature Id="Main" Title="RustWTM">
+      <ComponentRef Id="Gui" />
+      <ComponentRef Id="HardwareProvider" />
+      <ComponentRef Id="HardwareDocumentation" />
+      <ComponentRef Id="CpuDocumentation" />
+      <ComponentRef Id="LanguageDocumentation" />
+      <ComponentRef Id="DockerDocumentation" />
+      <ComponentRef Id="TaskManagerDocumentation" />
+      <ComponentRef Id="InstallationDocumentation" />
+      <ComponentRef Id="UsageDocumentation" />
+      <ComponentRef Id="ConfigurationDocumentation" />
+      <ComponentRef Id="MemoryGuardDocumentation" />
+      <ComponentRef Id="TelegramDocumentation" />
+      <ComponentRef Id="Cli" />
+      <ComponentRef Id="Service" />
+      <ComponentRef Id="Readme" />
+      <ComponentRef Id="License" />
+      <ComponentRef Id="Changelog" />
+      <ComponentRef Id="PathEntry" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

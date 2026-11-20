@@ -1,0 +1,194 @@
+# RustWTM configuration. Changes are picked up automatically.
+
+# Log what would be done without touching any process.
+# Review the log, then set to false to enforce.
+dry_run = true
+
+# How often processes are sampled.
+sample_interval_ms = 1000
+
+# Days of per-minute, per-app usage history kept on disk (App history tab
+# and long-term insights).
+history_days = 30
+
+# Programs that must never run, by file name (no paths or wildcards). They are
+# blocked before they start (Image File Execution Options), not killed after.
+# Applied only when dry_run = false; removed again when the service stops.
+# block = ["xmrig.exe"]
+
+[governor]
+enabled = true
+
+# Overload: system CPU >= high_cpu_percent for sustain_secs.
+high_cpu_percent = 90.0
+sustain_secs = 5
+
+# Recovery: system CPU <= recover_cpu_percent for recover_secs rolls limits back.
+recover_cpu_percent = 70.0
+recover_secs = 15
+
+# Only the top max_offenders processes above offender_min_cpu_percent
+# (share of the whole machine) are acted on.
+offender_min_cpu_percent = 2.0
+max_offenders = 3
+
+# One ladder step per process every step_cooldown_secs while overloaded.
+step_cooldown_secs = 5
+
+# Available steps: { priority = "idle" | "below_normal" | "normal" | "above_normal" },
+# "eco_qos", { cpu_cap = <percent of machine> },
+# { cpu_cap_relative = <fraction of usage when first throttled> },
+# { memory_cap_mb = <MiB> }, "suspend", "kill".
+ladder = [
+    { priority = "below_normal" },
+    "eco_qos",
+    { cpu_cap_relative = 0.5 },
+    { cpu_cap_relative = 0.25 },
+]
+
+# Image names (wildcards allowed) the governor never touches.
+# Core Windows processes and RustWTM itself are always protected.
+exempt = ["explorer.exe", "Taskmgr.exe"]
+
+# Never throttle the app you are working in (the foreground window, reported
+# by the RustWTM window while it runs) or the processes it started.
+protect_foreground = true
+
+# Long-term insights: every few minutes the service analyses the history
+# window and flags apps with sustained patterns, then applies actions to all
+# their instances until the pattern goes away. Respects dry_run.
+[insights]
+enabled = true
+window_hours = 24
+evaluate_every_minutes = 10
+# Apps seen for fewer minutes than this in the window are ignored.
+min_minutes = 60
+
+# Chronic CPU: average CPU over the window (share of the whole machine).
+chronic_cpu_percent = 10.0
+chronic_actions = [{ priority = "below_normal" }, "eco_qos"]
+
+# Memory growth (leak suspect): sustained growth rate once the app uses at
+# least growth_min_mb. Empty actions = report only (event + notification).
+growth_mb_per_hour = 200.0
+growth_min_mb = 2048
+# Required steadiness of the trend (R² of a linear fit): filters out apps whose
+# memory merely fluctuates.
+growth_min_fit = 0.7
+growth_actions = []
+
+# Chronic GPU: average GPU (busiest engine) over the window. Report only by
+# default: priority and efficiency mode do not limit GPU work.
+chronic_gpu_percent = 30.0
+chronic_gpu_actions = []
+
+# Handle and thread leaks (report only): a steady climb of this many per hour
+# (steadiness: growth_min_fit) once the app holds at least handle_min handles
+# or runs at least thread_min threads.
+handle_growth_per_hour = 1000.0
+handle_min = 10000
+thread_growth_per_hour = 50.0
+thread_min = 500
+
+exempt = ["explorer.exe", "Taskmgr.exe"]
+
+# Optional working-set trimming for the largest background apps under sustained
+# memory pressure. Reloading reclaimed pages can slow an app down.
+[memory_guard]
+enabled = false
+high_percent = 90.0
+sustain_secs = 15
+max_processes = 3
+min_working_set_mb = 300
+cooldown_secs = 300
+exempt = []
+
+# Swarms: a warning (desktop notification) when one program runs in at least
+# min_count copies, typically a tool that keeps starting helpers and never
+# waits for them. Nothing is ended; RustWTM's Overview offers to end them.
+[swarm]
+enabled = true
+min_count = 150
+exempt = []
+# End copies that have run longer than this many minutes (and what they
+# started): a helper that should take seconds is stuck by then. 0 = only warn.
+end_after_mins = 0
+
+# Reserve: resources kept for RustWTM itself, so it stays usable when the
+# machine is pinned at 100% CPU or out of memory. While system CPU stays at or
+# above trigger_cpu_percent for sustain_secs, every other program (except core
+# Windows processes and `exempt`) is moved off one core with CPU Sets, leaving
+# it to RustWTM and Windows; it is handed back once CPU stays at or below
+# release_cpu_percent for release_secs. working_set_mb of the service is
+# never paged out.
+[reserve]
+rescue_core = true
+trigger_cpu_percent = 95.0
+sustain_secs = 3
+release_cpu_percent = 75.0
+release_secs = 10
+working_set_mb = 48
+exempt = []
+
+# Game mode: while a full-screen app is in front (a game, a video, a
+# presentation), background apps using at least background_cpu_percent of the
+# machine get `actions`, rolled back when it ends. power_plan switches to the
+# High performance power plan meanwhile and back afterwards.
+[game_mode]
+enabled = true
+background_cpu_percent = 2.0
+actions = [{ priority = "below_normal" }, "eco_qos"]
+power_plan = false
+exempt = ["obs*.exe", "discord.exe", "audiodg.exe", "explorer.exe"]
+
+# App limits: every process of an app and everything it starts share a CPU
+# and/or memory budget (job object). scope = "each" gives every top-level
+# instance its own budget. Edit them in the GUI's Limits tab or with
+# `wtm app-limit`.
+#
+# [[limit]]
+# name = "node.exe"
+# cpu_cores = 2
+# memory_gb = 8
+# scope = "group"
+
+# Kill list: programs that may be ended. `cmdline` narrows a name to the
+# processes whose command line contains that text (or matches it, with * or
+# ?). With `cpu_above` (a share of the whole machine; one busy core on 8
+# logical processors is 12.5%) the service ends it once it keeps that up for
+# `for_secs`, optionally only while the whole PC is above `system_cpu_above`.
+# The panic button (GUI, Ctrl+Shift+K) and `wtm panic --yes` end every entry
+# at once. `tree` (default true) also ends what it started.
+#
+# [[kill]]
+# name = "node.exe"
+# cmdline = "vitest"
+# cpu_above = 25
+# for_secs = 120
+# system_cpu_above = 85
+#
+# [[kill]]
+# name = "python.exe"
+# cmdline = "*train.py*"
+
+# Per-process rules. `match` takes `name`, `path` and `cmdline` (text the
+# command line contains); `when` is optional (without it the rule fires as
+# soon as the process is seen).
+#
+# [[rule]]
+# name = "Keep Chrome renderers in check"
+# match = { name = "chrome.exe" }
+# when = { cpu_above = 20, for_secs = 10 }
+# actions = ["eco_qos", { cpu_cap_relative = 0.5 }]
+#
+# [[rule]]
+# name = "Cap a memory-hungry tool"
+# match = { path = "C:\\Tools\\*\\heavy.exe" }
+# when = { memory_above_mb = 4096 }
+# actions = [{ memory_cap_mb = 4096 }]
+#
+# [[rule]]
+# name = "Stop a background GPU miner"
+# match = { path = "C:\\Users\\*\\AppData\\*" }
+# when = { gpu_above = 80, for_secs = 60 }
+# actions = ["suspend"]

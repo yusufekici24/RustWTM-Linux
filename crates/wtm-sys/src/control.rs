@@ -1,0 +1,1392 @@
+//! Per-process control: terminate, suspend, priority, affinity, EcoQoS,
+//! memory dumps.
+
+use std::ops::BitOr;
+use std::os::windows::io::AsRawHandle;
+use std::path::Path;
+use std::time::Duration;
+
+use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+use windows::Win32::Foundation::{
+    E_FAIL, FILETIME, HANDLE, NTSTATUS, S_FALSE, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows::Win32::Security::{
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, LookupAccountSidW,
+    SID_NAME_USE, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenElevation,
+    TokenIntegrityLevel, TokenUser,
+};
+use windows::Win32::System::Diagnostics::Debug::{
+    CONTEXT_FLAGS, IsProcessSnapshotCallback, MINIDUMP_CALLBACK_INFORMATION,
+    MINIDUMP_CALLBACK_INPUT, MINIDUMP_CALLBACK_OUTPUT, MiniDumpWithFullMemory,
+    MiniDumpWithFullMemoryInfo, MiniDumpWithHandleData, MiniDumpWithThreadInfo,
+    MiniDumpWithUnloadedModules, MiniDumpWriteDump,
+};
+use windows::Win32::System::Diagnostics::ProcessSnapshotting::{
+    HPSS, PSS_CAPTURE_HANDLE_BASIC_INFORMATION, PSS_CAPTURE_HANDLE_NAME_INFORMATION,
+    PSS_CAPTURE_HANDLE_TYPE_SPECIFIC_INFORMATION, PSS_CAPTURE_HANDLES, PSS_CAPTURE_THREAD_CONTEXT,
+    PSS_CAPTURE_THREADS, PSS_CAPTURE_VA_CLONE, PSS_CREATE_RELEASE_SECTION,
+    PSS_CREATE_USE_VM_ALLOCATIONS, PssCaptureSnapshot, PssFreeSnapshot,
+};
+use windows::Win32::System::Memory::{
+    GetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_DISABLE, QUOTA_LIMITS_HARDWS_MIN_ENABLE,
+    SETPROCESSWORKINGSETSIZEEX_FLAGS, SetProcessWorkingSetSizeEx,
+};
+use windows::Win32::System::SystemInformation::{IMAGE_FILE_MACHINE, IMAGE_FILE_MACHINE_UNKNOWN};
+use windows::Win32::System::Threading::IsWow64Process2;
+use windows::Win32::System::Threading::{
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetPriorityClass,
+    GetProcessAffinityMask, GetProcessInformation, GetProcessTimes, HIGH_PRIORITY_CLASS,
+    IDLE_PRIORITY_CLASS, IsProcessCritical, NORMAL_PRIORITY_CLASS, OpenProcess, OpenProcessToken,
+    PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS, PROCESS_NAME_WIN32,
+    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SUSPEND_RESUME, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, PROCESS_VM_READ, ProcessPowerThrottling, QueryFullProcessImageNameW,
+    REALTIME_PRIORITY_CLASS, SetPriorityClass, SetProcessAffinityMask, SetProcessInformation,
+    TerminateProcess, WaitForSingleObject,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, PROCESS_CREATE_PROCESS, PROCESS_DUP_HANDLE,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, GetProcessDefaultCpuSets, MEMORY_PRIORITY, MEMORY_PRIORITY_INFORMATION,
+    MEMORY_PRIORITY_LOW, MEMORY_PRIORITY_NORMAL, PROCESS_SET_LIMITED_INFORMATION,
+    ProcessMemoryPriority, SetProcessDefaultCpuSets, SetThreadPriority,
+    THREAD_MODE_BACKGROUND_BEGIN, THREAD_PRIORITY_ABOVE_NORMAL,
+};
+use windows::core::PWSTR;
+
+use crate::handle::OwnedHandle;
+use crate::{Error, Result};
+
+windows::core::link!("ntdll.dll" "system" fn NtSuspendProcess(process_handle: HANDLE) -> NTSTATUS);
+windows::core::link!("ntdll.dll" "system" fn NtResumeProcess(process_handle: HANDLE) -> NTSTATUS);
+windows::core::link!("ntdll.dll" "system" fn NtQueryInformationProcess(
+    process_handle: HANDLE,
+    class: u32,
+    info: *mut core::ffi::c_void,
+    len: u32,
+    returned: *mut u32,
+) -> NTSTATUS);
+windows::core::link!("ntdll.dll" "system" fn NtSetInformationProcess(
+    process_handle: HANDLE,
+    class: u32,
+    info: *const core::ffi::c_void,
+    len: u32,
+) -> NTSTATUS);
+
+/// `PROCESSINFOCLASS::ProcessIoPriority`.
+const PROCESS_IO_PRIORITY: u32 = 33;
+
+/// `PROCESSINFOCLASS::ProcessCommandLineInformation` (Windows 8.1+).
+const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+
+/// Access rights requested when opening a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Access(PROCESS_ACCESS_RIGHTS);
+
+/// What a read of process memory that cannot be made reports.
+pub(crate) fn unsupported() -> Error {
+    windows::core::Error::from(E_FAIL).into()
+}
+
+/// Little-endian bytes as UTF-16 code units; an odd last byte is dropped.
+pub(crate) fn utf16_units(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect()
+}
+
+impl Access {
+    pub const QUERY: Self = Self(PROCESS_QUERY_LIMITED_INFORMATION);
+    /// Full query rights: needed for mitigation policies such as DEP;
+    /// granted for fewer processes than `QUERY`.
+    pub const QUERY_INFORMATION: Self = Self(PROCESS_QUERY_INFORMATION);
+    pub const TERMINATE: Self = Self(PROCESS_TERMINATE);
+    pub const SUSPEND_RESUME: Self = Self(PROCESS_SUSPEND_RESUME);
+    pub const SET_INFORMATION: Self = Self(PROCESS_SET_INFORMATION);
+    /// Enough to change default CPU Sets; granted for more processes than
+    /// `SET_INFORMATION`.
+    pub const SET_LIMITED_INFORMATION: Self = Self(PROCESS_SET_LIMITED_INFORMATION);
+    /// Required (with TERMINATE) to assign the process to a job object.
+    pub const SET_QUOTA: Self = Self(PROCESS_SET_QUOTA);
+    pub const SYNCHRONIZE: Self = Self(PROCESS_SYNCHRONIZE);
+    /// Enough to copy the process's handles, to name them.
+    pub const DUP_HANDLE: Self = Self(PROCESS_DUP_HANDLE);
+    /// Enough to read the working directory from the process's memory.
+    pub const READ_PARAMETERS: Self = Self(PROCESS_ACCESS_RIGHTS(
+        PROCESS_QUERY_LIMITED_INFORMATION.0 | PROCESS_VM_READ.0,
+    ));
+    /// Required to write a memory dump.
+    pub const DUMP: Self = Self(PROCESS_ACCESS_RIGHTS(
+        PROCESS_QUERY_INFORMATION.0 | PROCESS_VM_READ.0,
+    ));
+    /// A memory dump from a snapshot clone: the process is frozen for
+    /// milliseconds instead of the whole write.
+    pub const DUMP_CLONE: Self = Self(PROCESS_ACCESS_RIGHTS(
+        PROCESS_QUERY_INFORMATION.0
+            | PROCESS_VM_READ.0
+            | PROCESS_DUP_HANDLE.0
+            | PROCESS_CREATE_PROCESS.0,
+    ));
+}
+
+impl BitOr for Access {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PriorityClass {
+    Idle,
+    BelowNormal,
+    Normal,
+    AboveNormal,
+    High,
+    Realtime,
+}
+
+impl PriorityClass {
+    fn to_raw(self) -> PROCESS_CREATION_FLAGS {
+        match self {
+            Self::Idle => IDLE_PRIORITY_CLASS,
+            Self::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
+            Self::Normal => NORMAL_PRIORITY_CLASS,
+            Self::AboveNormal => ABOVE_NORMAL_PRIORITY_CLASS,
+            Self::High => HIGH_PRIORITY_CLASS,
+            Self::Realtime => REALTIME_PRIORITY_CLASS,
+        }
+    }
+
+    fn from_raw(raw: u32) -> Option<Self> {
+        [
+            Self::Idle,
+            Self::BelowNormal,
+            Self::Normal,
+            Self::AboveNormal,
+            Self::High,
+            Self::Realtime,
+        ]
+        .into_iter()
+        .find(|p| p.to_raw().0 == raw)
+    }
+}
+
+/// Power throttling (EcoQoS) state of a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EcoQos {
+    /// Windows decides (the default for every process).
+    SystemManaged,
+    /// Always throttled — "Efficiency mode".
+    On,
+    /// Explicitly opted out of throttling.
+    Off,
+}
+
+/// A process's I/O priority, in Task Manager's words.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum IoPriority {
+    /// `IoPriorityVeryLow`, used by background mode.
+    Background,
+    Low,
+    Normal,
+    High,
+    Critical,
+}
+
+impl IoPriority {
+    /// The `IO_PRIORITY_HINT` value.
+    pub fn hint(self) -> u32 {
+        match self {
+            Self::Background => 0,
+            Self::Low => 1,
+            Self::Normal => 2,
+            Self::High => 3,
+            Self::Critical => 4,
+        }
+    }
+
+    /// From an `IO_PRIORITY_HINT`.
+    pub fn from_hint(hint: u32) -> Option<Self> {
+        Some(match hint {
+            0 => Self::Background,
+            1 => Self::Low,
+            2 => Self::Normal,
+            3 => Self::High,
+            4 => Self::Critical,
+            _ => return None,
+        })
+    }
+}
+
+/// A process's memory priority: how soon Windows repurposes its standby
+/// pages for other programs (the lower, the sooner).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum MemoryPriority {
+    VeryLow,
+    Low,
+    Medium,
+    BelowNormal,
+    Normal,
+}
+
+impl MemoryPriority {
+    /// The `MEMORY_PRIORITY_*` value.
+    pub fn value(self) -> u32 {
+        match self {
+            Self::VeryLow => 1,
+            Self::Low => 2,
+            Self::Medium => 3,
+            Self::BelowNormal => 4,
+            Self::Normal => 5,
+        }
+    }
+
+    /// From a `MEMORY_PRIORITY_*` value; the lowest (0) reads as very low.
+    pub fn from_value(value: u32) -> Option<Self> {
+        Some(match value {
+            0 | 1 => Self::VeryLow,
+            2 => Self::Low,
+            3 => Self::Medium,
+            4 => Self::BelowNormal,
+            5 => Self::Normal,
+            _ => return None,
+        })
+    }
+}
+
+/// Lowers (`true`) or restores this process's memory priority. With a low
+/// priority, Windows repurposes its standby pages before other programs'.
+/// Nothing is freed or paged out by this call itself.
+pub fn set_own_memory_priority(low: bool) -> Result<()> {
+    let info = MEMORY_PRIORITY_INFORMATION {
+        MemoryPriority: if low {
+            MEMORY_PRIORITY_LOW
+        } else {
+            MEMORY_PRIORITY_NORMAL
+        },
+    };
+    // SAFETY: the current-process pseudo handle needs no closing, and `info`
+    // is a correctly sized MEMORY_PRIORITY_INFORMATION.
+    unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessMemoryPriority,
+            (&raw const info).cast(),
+            size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+        )?
+    };
+    Ok(())
+}
+
+/// The instruction set a process runs as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Architecture {
+    X86,
+    X64,
+    Arm,
+    Arm64,
+    Other(u16),
+}
+
+impl Architecture {
+    /// From an `IMAGE_FILE_MACHINE_*` value.
+    pub fn from_machine(machine: u16) -> Self {
+        match machine {
+            0x014c => Self::X86,
+            0x8664 => Self::X64,
+            0x01c0 | 0x01c4 => Self::Arm,
+            0xaa64 => Self::Arm64,
+            other => Self::Other(other),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::X86 => "x86".into(),
+            Self::X64 => "x64".into(),
+            Self::Arm => "ARM".into(),
+            Self::Arm64 => "ARM64".into(),
+            Self::Other(m) => format!("0x{m:04x}"),
+        }
+    }
+}
+
+/// The mandatory integrity level of a process's token: what it may write to.
+/// Sandboxed browsers run Low or Untrusted, ordinary programs Medium,
+/// programs run as administrator High, services System.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Integrity {
+    Untrusted,
+    Low,
+    Medium,
+    MediumPlus,
+    High,
+    System,
+    Protected,
+    /// A level between the well-known ones, as its relative identifier.
+    Other(u32),
+}
+
+impl Integrity {
+    /// From the last relative identifier of the token's mandatory label.
+    pub fn from_rid(rid: u32) -> Self {
+        match rid {
+            0x0000 => Self::Untrusted,
+            0x1000 => Self::Low,
+            0x2000 => Self::Medium,
+            0x2100 => Self::MediumPlus,
+            0x3000 => Self::High,
+            0x4000 => Self::System,
+            0x5000 => Self::Protected,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// An open process handle.
+#[derive(Debug)]
+pub struct ProcessHandle {
+    handle: OwnedHandle,
+    pid: u32,
+}
+
+impl ProcessHandle {
+    pub fn open(pid: u32, access: Access) -> Result<Self> {
+        // SAFETY: plain FFI call; the returned handle is owned by us.
+        let raw = unsafe { OpenProcess(access.0, false, pid)? };
+        Ok(Self {
+            handle: OwnedHandle::new(raw),
+            pid,
+        })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn raw(&self) -> HANDLE {
+        self.handle.raw()
+    }
+
+    /// GDI and USER objects the process holds, as Task Manager's columns;
+    /// 0 and 0 for processes without a window station.
+    pub fn gui_objects(&self) -> (u32, u32) {
+        use windows::Win32::System::Threading::{GR_GDIOBJECTS, GR_USEROBJECTS, GetGuiResources};
+        // SAFETY: valid handle owned by `self`; a failure returns 0.
+        unsafe {
+            (
+                GetGuiResources(self.raw(), GR_GDIOBJECTS),
+                GetGuiResources(self.raw(), GR_USEROBJECTS),
+            )
+        }
+    }
+
+    /// Creation time as a FILETIME value; identifies the process across PID reuse.
+    pub fn create_time(&self) -> Result<i64> {
+        let mut create = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: all out-pointers reference live FILETIMEs.
+        unsafe { GetProcessTimes(self.raw(), &mut create, &mut exit, &mut kernel, &mut user)? };
+        Ok(((u64::from(create.dwHighDateTime) << 32) | u64::from(create.dwLowDateTime)) as i64)
+    }
+
+    pub fn image_path(&self) -> Result<String> {
+        // Almost every path fits on the stack; long ones get the most a
+        // path can be.
+        let mut small = [0u16; 1024];
+        match self.image_path_into(&mut small) {
+            Err(Error::Win32(e)) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() => {
+                self.image_path_into(&mut vec![0u16; 32 * 1024])
+            }
+            r => r,
+        }
+    }
+
+    fn image_path_into(&self, buf: &mut [u16]) -> Result<String> {
+        let mut len = buf.len() as u32;
+        // SAFETY: `buf` holds `len` u16s; on success `len` is the written length.
+        unsafe {
+            QueryFullProcessImageNameW(
+                self.raw(),
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            )?
+        };
+        Ok(crate::utf16_lossy(&buf[..len as usize]))
+    }
+
+    /// The command line the process was started with.
+    pub fn command_line(&self) -> Result<String> {
+        let mut len = 0u32;
+        // SAFETY: a zero-length query only reports the required size.
+        unsafe {
+            let _ = NtQueryInformationProcess(
+                self.raw(),
+                PROCESS_COMMAND_LINE_INFORMATION,
+                std::ptr::null_mut(),
+                0,
+                &mut len,
+            );
+        }
+        // The process may rewrite its command line between the size query
+        // and the read: asked again, a few times, with the new size.
+        const TOO_SMALL: [u32; 3] = [0xC000_0004, 0xC000_0023, 0x8000_0005];
+        let mut attempts = 0;
+        let (buf, status) = loop {
+            // u64 elements keep the UNICODE_STRING header aligned.
+            let mut buf = vec![0u64; (len as usize).div_ceil(8).max(2)];
+            let size = (buf.len() * 8) as u32;
+            // SAFETY: buf is writable for size bytes.
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    self.raw(),
+                    PROCESS_COMMAND_LINE_INFORMATION,
+                    buf.as_mut_ptr().cast(),
+                    size,
+                    &mut len,
+                )
+            };
+            attempts += 1;
+            if !TOO_SMALL.contains(&(status.0 as u32)) || attempts == 4 || len <= size {
+                break (buf, status);
+            }
+        };
+        nt_ok("NtQueryInformationProcess", status)?;
+        // SAFETY: on success the buffer starts with a UNICODE_STRING whose
+        // text lies inside the same buffer.
+        let text = unsafe {
+            let s = &*buf.as_ptr().cast::<UNICODE_STRING>();
+            if s.Length == 0 || s.Buffer.is_null() {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(s.Buffer.0, usize::from(s.Length) / 2)
+            }
+        };
+        Ok(crate::utf16_lossy(text))
+    }
+
+    /// The process's current (working) directory, read from its process
+    /// parameters. Needs [`Access::READ_PARAMETERS`]. 32-bit processes keep
+    /// theirs in a separate block and are reported as unsupported.
+    pub fn current_directory(&self) -> Result<String> {
+        if self
+            .architecture()
+            .is_ok_and(|a| a == Architecture::X86 || a == Architecture::Arm)
+        {
+            return Err(unsupported());
+        }
+        // 64-bit layouts: PEB.ProcessParameters at 0x20, and
+        // RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.DosPath at 0x38.
+        let parameters = self.remote_word(self.peb_address()? + 0x20)?;
+        let mut header = [0u8; 16];
+        self.read_remote(parameters + 0x38, &mut header)?;
+        let length = usize::from(u16::from_le_bytes([header[0], header[1]]));
+        let buffer = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes")) as usize;
+        if length == 0 || buffer == 0 || length > 2 * 32_767 {
+            return Err(unsupported());
+        }
+        let mut text = vec![0u8; length];
+        self.read_remote(buffer, &mut text)?;
+        Ok(crate::utf16_lossy(&utf16_units(&text)))
+    }
+
+    /// Reads exactly `out.len()` bytes at `address` in the process; a
+    /// partial read (memory freed or changed meanwhile) is an error. Needs
+    /// `PROCESS_VM_READ`.
+    pub(crate) fn read_remote(&self, address: usize, out: &mut [u8]) -> Result<()> {
+        use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        let mut done = 0usize;
+        // SAFETY: `out` is writable for its length; the remote address is
+        // only read through the system call, which validates it.
+        unsafe {
+            ReadProcessMemory(
+                self.raw(),
+                address as *const core::ffi::c_void,
+                out.as_mut_ptr().cast(),
+                out.len(),
+                Some(&mut done),
+            )?
+        };
+        if done == out.len() {
+            Ok(())
+        } else {
+            Err(unsupported())
+        }
+    }
+
+    /// A 64-bit pointer-sized value in the process.
+    pub(crate) fn remote_word(&self, address: usize) -> Result<usize> {
+        let mut bytes = [0u8; 8];
+        self.read_remote(address, &mut bytes)?;
+        Ok(u64::from_le_bytes(bytes) as usize)
+    }
+
+    /// A 32-bit value in the process, such as a pointer of a WOW64 process.
+    pub(crate) fn remote_u32(&self, address: usize) -> Result<u32> {
+        let mut bytes = [0u8; 4];
+        self.read_remote(address, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    /// The address of the process's (native, 64-bit) PEB.
+    pub(crate) fn peb_address(&self) -> Result<usize> {
+        // PROCESS_BASIC_INFORMATION: the PEB address is its second field.
+        let mut basic = [0usize; 6];
+        let mut len = 0u32;
+        // SAFETY: `basic` is writable for its full size.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                self.raw(),
+                0,
+                basic.as_mut_ptr().cast(),
+                size_of_val(&basic) as u32,
+                &mut len,
+            )
+        };
+        nt_ok("NtQueryInformationProcess", status)?;
+        match basic[1] {
+            0 => Err(unsupported()),
+            peb => Ok(peb),
+        }
+    }
+
+    /// The address of a WOW64 process's 32-bit PEB; `None` for a native
+    /// process.
+    pub(crate) fn peb32_address(&self) -> Result<Option<usize>> {
+        /// `PROCESSINFOCLASS::ProcessWow64Information`.
+        const PROCESS_WOW64_INFORMATION: u32 = 26;
+        let mut peb32 = 0usize;
+        let mut len = 0u32;
+        // SAFETY: `peb32` is writable for a pointer-sized value.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                self.raw(),
+                PROCESS_WOW64_INFORMATION,
+                std::ptr::from_mut(&mut peb32).cast(),
+                size_of::<usize>() as u32,
+                &mut len,
+            )
+        };
+        nt_ok("NtQueryInformationProcess", status)?;
+        Ok((peb32 != 0).then_some(peb32))
+    }
+
+    /// The account the process runs as, e.g. NT AUTHORITY\SYSTEM.
+    pub fn user(&self) -> Result<String> {
+        let mut raw = HANDLE::default();
+        // SAFETY: `raw` receives a token handle that OwnedHandle closes.
+        unsafe { OpenProcessToken(self.raw(), TOKEN_QUERY, &mut raw)? };
+        let token = OwnedHandle::new(raw);
+        let mut len = 0u32;
+        // SAFETY: a null buffer only reports the required size.
+        let _ = unsafe { GetTokenInformation(token.raw(), TokenUser, None, 0, &mut len) };
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        // SAFETY: uf is writable for len bytes and suitably aligned.
+        unsafe {
+            GetTokenInformation(
+                token.raw(),
+                TokenUser,
+                Some(buf.as_mut_ptr().cast()),
+                len,
+                &mut len,
+            )?
+        };
+        // SAFETY: on success the buffer holds a TOKEN_USER.
+        let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut name = [0u16; 256];
+        let mut domain = [0u16; 256];
+        let (mut name_len, mut domain_len) = (name.len() as u32, domain.len() as u32);
+        let mut kind = SID_NAME_USE::default();
+        // SAFETY: both buffers are writable for the lengths passed; sid
+        // points into uf, which outlives the call.
+        unsafe {
+            LookupAccountSidW(
+                None,
+                sid,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                Some(PWSTR(domain.as_mut_ptr())),
+                &mut domain_len,
+                &mut kind,
+            )?
+        };
+        let name = String::from_utf16_lossy(&name[..name_len as usize]);
+        Ok(match domain_len {
+            0 => name,
+            n => format!(
+                "{}\\{name}",
+                String::from_utf16_lossy(&domain[..n as usize])
+            ),
+        })
+    }
+
+    /// Whether the process runs with an elevated (administrator) token.
+    /// Fails when the token cannot be opened, which is not the same as `false`.
+    pub fn elevated(&self) -> Result<bool> {
+        let mut raw = HANDLE::default();
+        // SAFETY: `raw` receives a token handle that OwnedHandle closes.
+        unsafe { OpenProcessToken(self.raw(), TOKEN_QUERY, &mut raw)? };
+        let token = OwnedHandle::new(raw);
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        // SAFETY: `elevation` is writable for its full size.
+        unsafe {
+            GetTokenInformation(
+                token.raw(),
+                TokenElevation,
+                Some(std::ptr::from_mut(&mut elevation).cast()),
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            )?
+        };
+        Ok(elevation.TokenIsElevated != 0)
+    }
+
+    /// The integrity level of the process's token.
+    pub fn integrity(&self) -> Result<Integrity> {
+        let mut raw = HANDLE::default();
+        // SAFETY: `raw` receives a token handle that OwnedHandle closes.
+        unsafe { OpenProcessToken(self.raw(), TOKEN_QUERY, &mut raw)? };
+        let token = OwnedHandle::new(raw);
+        let mut len = 0u32;
+        // SAFETY: a null buffer only reports the required size.
+        let _ = unsafe { GetTokenInformation(token.raw(), TokenIntegrityLevel, None, 0, &mut len) };
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        // SAFETY: buf is writable for len bytes and aligned for the label.
+        unsafe {
+            GetTokenInformation(
+                token.raw(),
+                TokenIntegrityLevel,
+                Some(buf.as_mut_ptr().cast()),
+                len,
+                &mut len,
+            )?
+        };
+        // SAFETY: on success the buffer holds a TOKEN_MANDATORY_LABEL whose
+        // SID points into the same buffer, which outlives these reads.
+        let rid = unsafe {
+            let sid = (*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
+            let count = *GetSidSubAuthorityCount(sid);
+            if count == 0 {
+                return Err(windows::core::Error::from(E_FAIL).into());
+            }
+            *GetSidSubAuthority(sid, u32::from(count) - 1)
+        };
+        Ok(Integrity::from_rid(rid))
+    }
+
+    /// The instruction set the process runs as.
+    pub fn architecture(&self) -> Result<Architecture> {
+        let mut process = IMAGE_FILE_MACHINE::default();
+        let mut native = IMAGE_FILE_MACHINE::default();
+        // SAFETY: both out-pointers reference live values.
+        unsafe { IsWow64Process2(self.raw(), &mut process, Some(&mut native))? };
+        // UNKNOWN: not a WOW64 process, so it runs as the native machine.
+        let machine = if process == IMAGE_FILE_MACHINE_UNKNOWN {
+            native
+        } else {
+            process
+        };
+        Ok(Architecture::from_machine(machine.0))
+    }
+
+    /// Moves as much of the working set as possible to the standby list.
+    /// Pages come back on demand; nothing is lost. Requires `Access::SET_QUOTA`.
+    pub fn trim_working_set(&self) -> Result<()> {
+        // SAFETY: valid handle; (-1, -1) means "remove as many pages as possible".
+        unsafe {
+            SetProcessWorkingSetSizeEx(
+                self.raw(),
+                usize::MAX,
+                usize::MAX,
+                SETPROCESSWORKINGSETSIZEEX_FLAGS(0),
+            )?
+        };
+        Ok(())
+    }
+
+    /// Whether terminating this process would bug-check the system.
+    pub fn is_critical(&self) -> Result<bool> {
+        let mut critical = windows::core::BOOL::default();
+        // SAFETY: `critical` is a writable BOOL.
+        unsafe { IsProcessCritical(self.raw(), &mut critical)? };
+        Ok(critical.as_bool())
+    }
+
+    /// Requires `Access::SYNCHRONIZE`.
+    pub fn wait_exit(&self, timeout: Duration) -> Result<bool> {
+        let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: valid handle owned by `self`.
+        match unsafe { WaitForSingleObject(self.raw(), ms) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(windows::core::Error::from_thread().into()),
+        }
+    }
+
+    /// Writes a full memory dump (like Task Manager's "Create memory dump
+    /// file") to `path`, replacing it. Requires `Access::DUMP`; with
+    /// `Access::DUMP_CLONE` the process is first cloned (a copy-on-write
+    /// process snapshot) and the dump written from the clone, so it is frozen
+    /// for milliseconds rather than for the whole write. Returns whether the
+    /// clone was used.
+    pub fn write_dump(&self, path: &Path) -> Result<bool> {
+        let file = std::fs::File::create(path).map_err(|e| {
+            let hr = e.raw_os_error().map_or(E_FAIL, |code| {
+                windows::core::HRESULT::from_win32(code as u32)
+            });
+            Error::Win32(hr.into())
+        })?;
+        let out = HANDLE(file.as_raw_handle());
+        let kind = MiniDumpWithFullMemory
+            | MiniDumpWithFullMemoryInfo
+            | MiniDumpWithHandleData
+            | MiniDumpWithThreadInfo
+            | MiniDumpWithUnloadedModules;
+
+        let result = match CloneSnapshot::capture(self.raw()) {
+            Some(snapshot) => {
+                let callback = MINIDUMP_CALLBACK_INFORMATION {
+                    CallbackRoutine: Some(snapshot_callback),
+                    CallbackParam: std::ptr::null_mut(),
+                };
+                // SAFETY: the snapshot handle stays valid until `snapshot` is
+                // dropped after the call; `out` is a writable file handle
+                // owned by `file`; `callback` outlives the call.
+                unsafe {
+                    MiniDumpWriteDump(
+                        HANDLE(snapshot.0.0),
+                        self.pid,
+                        out,
+                        kind,
+                        None,
+                        None,
+                        Some(&raw const callback),
+                    )
+                }
+                .map(|()| true)
+            }
+            // SAFETY: valid process handle owned by `self`; `out` is a
+            // writable file handle owned by `file`.
+            None => unsafe { MiniDumpWriteDump(self.raw(), self.pid, out, kind, None, None, None) }
+                .map(|()| false),
+        };
+
+        drop(file);
+        result.map_err(|e| {
+            let _ = std::fs::remove_file(path);
+            e.into()
+        })
+    }
+
+    pub fn terminate(&self, exit_code: u32) -> Result<()> {
+        // SAFETY: valid handle owned by `self`.
+        unsafe { TerminateProcess(self.raw(), exit_code)? };
+        Ok(())
+    }
+
+    pub fn suspend(&self) -> Result<()> {
+        // SAFETY: valid handle owned by `self`.
+        nt_ok("NtSuspendProcess", unsafe { NtSuspendProcess(self.raw()) })
+    }
+
+    pub fn resume(&self) -> Result<()> {
+        // SAFETY: valid handle owned by `self`.
+        nt_ok("NtResumeProcess", unsafe { NtResumeProcess(self.raw()) })
+    }
+
+    pub fn priority(&self) -> Result<PriorityClass> {
+        // SAFETY: valid handle owned by `self`.
+        let raw = unsafe { GetPriorityClass(self.raw()) };
+        if raw == 0 {
+            return Err(windows::core::Error::from_thread().into());
+        }
+        PriorityClass::from_raw(raw).ok_or(Error::Nt {
+            call: "GetPriorityClass",
+            status: raw,
+        })
+    }
+
+    pub fn set_priority(&self, priority: PriorityClass) -> Result<()> {
+        // SAFETY: valid handle owned by `self`.
+        unsafe { SetPriorityClass(self.raw(), priority.to_raw())? };
+        Ok(())
+    }
+
+    /// Returns `(process_mask, system_mask)` for the process's processor group.
+    pub fn affinity(&self) -> Result<(u64, u64)> {
+        let mut process = 0usize;
+        let mut system = 0usize;
+        // SAFETY: both out-pointers reference live usizes.
+        unsafe { GetProcessAffinityMask(self.raw(), &mut process, &mut system)? };
+        Ok((process as u64, system as u64))
+    }
+
+    pub fn set_affinity(&self, mask: u64) -> Result<()> {
+        // SAFETY: valid handle owned by `self`.
+        unsafe { SetProcessAffinityMask(self.raw(), mask as usize)? };
+        Ok(())
+    }
+
+    /// The processor groups the process's threads run in.
+    pub fn groups(&self) -> Result<Vec<u16>> {
+        let mut groups = vec![0u16; 64];
+        let mut count = 64u16;
+        // SAFETY: the group array is writable for count elements; handle is live.
+        unsafe {
+            windows::Win32::System::Threading::GetProcessGroupAffinity(
+                self.raw(),
+                &mut count,
+                groups.as_mut_ptr(),
+            )
+            .ok()?
+        };
+        groups.truncate(usize::from(count));
+        Ok(groups)
+    }
+
+    pub fn core_affinity(
+        &self,
+        selection: crate::cpu::CoreSelection,
+    ) -> std::result::Result<u64, String> {
+        let groups = self.groups().map_err(|e| e.to_string())?;
+        if groups.len() != 1 {
+            return Err("Core-type affinity requires a process in one processor group; cross-group masks are not supported".into());
+        }
+        let topology = crate::cpu::query(Some(self.raw())).map_err(|e| e.to_string())?;
+        let (_, allowed) = self.affinity().map_err(|e| e.to_string())?;
+        topology.mask(selection, groups[0], allowed)
+    }
+
+    pub fn eco_qos(&self) -> Result<EcoQos> {
+        let mut state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ..Default::default()
+        };
+        // SAFETY: `state` is a correctly sized, versioned structure.
+        unsafe {
+            GetProcessInformation(
+                self.raw(),
+                ProcessPowerThrottling,
+                (&raw mut state).cast(),
+                size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            )?
+        };
+        let bit = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        Ok(
+            match (state.ControlMask & bit != 0, state.StateMask & bit != 0) {
+                (false, _) => EcoQos::SystemManaged,
+                (true, true) => EcoQos::On,
+                (true, false) => EcoQos::Off,
+            },
+        )
+    }
+
+    /// Sets the I/O priority the process's I/O gets by default. Raising it
+    /// above normal needs a privilege RustWTM does not use. Requires
+    /// `Access::SET_INFORMATION`.
+    pub fn set_io_priority(&self, priority: IoPriority) -> Result<()> {
+        let hint = priority.hint();
+        // SAFETY: `hint` is a readable ULONG of the size passed.
+        let status = unsafe {
+            NtSetInformationProcess(
+                self.raw(),
+                PROCESS_IO_PRIORITY,
+                (&raw const hint).cast(),
+                size_of::<u32>() as u32,
+            )
+        };
+        nt_ok("NtSetInformationProcess", status)
+    }
+
+    /// The process's memory priority. Requires `Access::QUERY`.
+    pub fn memory_priority(&self) -> Result<MemoryPriority> {
+        let mut info = MEMORY_PRIORITY_INFORMATION::default();
+        // SAFETY: `info` is a correctly sized MEMORY_PRIORITY_INFORMATION.
+        unsafe {
+            GetProcessInformation(
+                self.raw(),
+                ProcessMemoryPriority,
+                (&raw mut info).cast(),
+                size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+            )?
+        };
+        MemoryPriority::from_value(info.MemoryPriority.0)
+            .ok_or_else(|| windows::core::Error::from(E_FAIL).into())
+    }
+
+    /// Sets the process's memory priority. Requires `Access::SET_INFORMATION`.
+    pub fn set_memory_priority(&self, priority: MemoryPriority) -> Result<()> {
+        let info = MEMORY_PRIORITY_INFORMATION {
+            MemoryPriority: MEMORY_PRIORITY(priority.value()),
+        };
+        // SAFETY: `info` is a correctly sized MEMORY_PRIORITY_INFORMATION.
+        unsafe {
+            SetProcessInformation(
+                self.raw(),
+                ProcessMemoryPriority,
+                (&raw const info).cast(),
+                size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+            )?
+        };
+        Ok(())
+    }
+
+    /// The I/O priority the process's I/O gets by default.
+    pub fn io_priority(&self) -> Result<IoPriority> {
+        let mut hint = 0u32;
+        let mut len = 0u32;
+        // SAFETY: `hint` is a writable ULONG of the size passed.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                self.raw(),
+                PROCESS_IO_PRIORITY,
+                (&raw mut hint).cast(),
+                size_of::<u32>() as u32,
+                &mut len,
+            )
+        };
+        nt_ok("NtQueryInformationProcess", status)?;
+        IoPriority::from_hint(hint).ok_or_else(|| windows::core::Error::from(E_FAIL).into())
+    }
+
+    /// The full name of the package a packaged (Store) app runs from;
+    /// `None` for ordinary programs.
+    pub fn package_full_name(&self) -> Result<Option<String>> {
+        use windows::Win32::Foundation::{APPMODEL_ERROR_NO_PACKAGE, ERROR_SUCCESS};
+        use windows::Win32::Storage::Packaging::Appx::GetPackageFullName;
+        // PACKAGE_FULL_NAME_MAX_LENGTH is 127, plus the terminator.
+        let mut name = [0u16; 128];
+        let mut len = name.len() as u32;
+        // SAFETY: `name` is writable for `len` characters.
+        let error = unsafe {
+            GetPackageFullName(
+                self.raw(),
+                &mut len,
+                Some(windows::core::PWSTR(name.as_mut_ptr())),
+            )
+        };
+        if error == APPMODEL_ERROR_NO_PACKAGE {
+            return Ok(None);
+        }
+        if error != ERROR_SUCCESS {
+            return Err(windows::core::Error::from(error.to_hresult()).into());
+        }
+        // `len` counts the terminator.
+        let used = (len as usize).saturating_sub(1).min(name.len());
+        Ok(Some(String::from_utf16_lossy(&name[..used])))
+    }
+
+    /// The process's default CPU Set IDs; empty when it may use every
+    /// processor. Requires `Access::QUERY`.
+    pub fn default_cpu_sets(&self) -> Result<Vec<u32>> {
+        let mut ids = vec![0u32; 64];
+        loop {
+            let mut required = 0u32;
+            // SAFETY: `ids` is writable for its length; `required` is writable.
+            let ok = unsafe {
+                GetProcessDefaultCpuSets(self.raw(), Some(&mut ids), &mut required).as_bool()
+            };
+            if ok {
+                ids.truncate(required as usize);
+                return Ok(ids);
+            }
+            let error = windows::core::Error::from_thread();
+            if error.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult()
+                || required as usize <= ids.len()
+            {
+                return Err(error.into());
+            }
+            ids.resize(required as usize, 0);
+        }
+    }
+
+    /// Confines the process's threads that have no CPU Sets of their own to
+    /// `ids`; an empty slice lifts the restriction. Requires
+    /// `Access::SET_LIMITED_INFORMATION`.
+    pub fn set_default_cpu_sets(&self, ids: &[u32]) -> Result<()> {
+        let ids = (!ids.is_empty()).then_some(ids);
+        // SAFETY: valid handle; the slice, if any, outlives the call.
+        unsafe { SetProcessDefaultCpuSets(self.raw(), ids).ok()? };
+        Ok(())
+    }
+
+    /// Keeps at least `min_bytes` of the process resident: Windows will not
+    /// trim its working set below that, even under memory pressure. Requires
+    /// `Access::QUERY | Access::SET_QUOTA`.
+    pub fn lock_working_set(&self, min_bytes: usize) -> Result<()> {
+        let (mut min, mut max, mut flags) = (0usize, 0usize, 0u32);
+        // SAFETY: all out-pointers reference live locals.
+        unsafe { GetProcessWorkingSetSizeEx(self.raw(), &mut min, &mut max, &mut flags).ok()? };
+        let max = max.max(min_bytes.saturating_add(min_bytes / 2));
+        // SAFETY: valid handle; the sizes are plain values.
+        unsafe {
+            SetProcessWorkingSetSizeEx(
+                self.raw(),
+                min_bytes,
+                max,
+                QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE,
+            )?
+        };
+        Ok(())
+    }
+
+    /// Restores normal memory priority, so the process's pages are the last
+    /// to be repurposed from the standby list. Requires `Access::SET_INFORMATION`.
+    pub fn set_normal_memory_priority(&self) -> Result<()> {
+        let info = MEMORY_PRIORITY_INFORMATION {
+            MemoryPriority: MEMORY_PRIORITY_NORMAL,
+        };
+        // SAFETY: `info` is a correctly sized MEMORY_PRIORITY_INFORMATION.
+        unsafe {
+            SetProcessInformation(
+                self.raw(),
+                ProcessMemoryPriority,
+                (&raw const info).cast(),
+                size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+            )?
+        };
+        Ok(())
+    }
+
+    pub fn set_eco_qos(&self, mode: EcoQos) -> Result<()> {
+        let bit = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        let (control, state) = match mode {
+            EcoQos::SystemManaged => (0, 0),
+            EcoQos::On => (bit, bit),
+            EcoQos::Off => (bit, 0),
+        };
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: control,
+            StateMask: state,
+        };
+        // SAFETY: `state` is a correctly sized, versioned structure.
+        unsafe {
+            SetProcessInformation(
+                self.raw(),
+                ProcessPowerThrottling,
+                (&raw const state).cast(),
+                size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            )?
+        };
+        Ok(())
+    }
+}
+
+/// Raises the calling thread above the other threads of its priority class,
+/// e.g. so a UI thread keeps painting while workers are busy.
+pub fn raise_current_thread() -> Result<()> {
+    // SAFETY: the pseudo handle of the current thread needs no closing.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)? };
+    Ok(())
+}
+
+/// Puts the calling thread in background mode: lowest CPU, I/O and memory
+/// priority, so long work such as scanning a disk never slows down the
+/// machine or the window. Lasts until the thread exits.
+pub fn enter_background_mode() -> Result<()> {
+    // SAFETY: the pseudo handle of the current thread needs no closing.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN)? };
+    Ok(())
+}
+
+/// A copy-on-write clone of a process (`PssCaptureSnapshot`), freed on drop.
+struct CloneSnapshot(HPSS);
+
+impl CloneSnapshot {
+    /// Clones `process`, or `None` when the handle lacks the rights for it
+    /// (`PROCESS_CREATE_PROCESS`, `PROCESS_DUP_HANDLE`) or cloning fails.
+    fn capture(process: HANDLE) -> Option<Self> {
+        let flags = PSS_CAPTURE_VA_CLONE
+            | PSS_CAPTURE_HANDLES
+            | PSS_CAPTURE_HANDLE_NAME_INFORMATION
+            | PSS_CAPTURE_HANDLE_BASIC_INFORMATION
+            | PSS_CAPTURE_HANDLE_TYPE_SPECIFIC_INFORMATION
+            | PSS_CAPTURE_THREADS
+            | PSS_CAPTURE_THREAD_CONTEXT
+            | PSS_CREATE_USE_VM_ALLOCATIONS
+            | PSS_CREATE_RELEASE_SECTION;
+        let mut snapshot = HPSS::default();
+        // SAFETY: valid process handle; `snapshot` is a writable HPSS.
+        let status =
+            unsafe { PssCaptureSnapshot(process, flags, Some(CONTEXT_ALL.0), &mut snapshot) };
+        (status == 0 && !snapshot.is_invalid()).then_some(Self(snapshot))
+    }
+}
+
+impl Drop for CloneSnapshot {
+    fn drop(&mut self) {
+        // SAFETY: the snapshot was captured into this process and is freed
+        // exactly once.
+        unsafe {
+            let _ = PssFreeSnapshot(GetCurrentProcess(), self.0);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+const CONTEXT_ALL: CONTEXT_FLAGS = windows::Win32::System::Diagnostics::Debug::CONTEXT_ALL_AMD64;
+#[cfg(target_arch = "aarch64")]
+const CONTEXT_ALL: CONTEXT_FLAGS = windows::Win32::System::Diagnostics::Debug::CONTEXT_ALL_ARM64;
+#[cfg(target_arch = "x86")]
+const CONTEXT_ALL: CONTEXT_FLAGS = windows::Win32::System::Diagnostics::Debug::CONTEXT_ALL_X86;
+
+/// `MiniDumpWriteDump` callback that, asked whether its handle is a process
+/// snapshot, answers `S_FALSE` (yes); every other request keeps its default.
+unsafe extern "system" fn snapshot_callback(
+    _param: *mut core::ffi::c_void,
+    input: *const MINIDUMP_CALLBACK_INPUT,
+    output: *mut MINIDUMP_CALLBACK_OUTPUT,
+) -> windows::core::BOOL {
+    // SAFETY: dbghelp passes valid input and output records; both structs
+    // are packed, so fields are accessed through unaligned reads/writes.
+    unsafe {
+        let kind = std::ptr::addr_of!((*input).CallbackType).read_unaligned();
+        if kind == IsProcessSnapshotCallback.0 as u32 {
+            std::ptr::addr_of_mut!((*output).Anonymous.Status).write_unaligned(S_FALSE);
+        }
+    }
+    true.into()
+}
+
+fn nt_ok(call: &'static str, status: NTSTATUS) -> Result<()> {
+    if status.is_ok() {
+        Ok(())
+    } else {
+        Err(Error::Nt {
+            call,
+            status: status.0 as u32,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_priority_reads_task_managers_levels() {
+        assert_eq!(IoPriority::from_hint(0), Some(IoPriority::Background));
+        assert_eq!(IoPriority::from_hint(2), Some(IoPriority::Normal));
+        assert_eq!(IoPriority::from_hint(4), Some(IoPriority::Critical));
+        assert_eq!(IoPriority::from_hint(5), None);
+        let me = ProcessHandle::open(std::process::id(), Access::QUERY).unwrap();
+        assert!(me.io_priority().is_ok());
+        // A test binary is not a packaged app.
+        assert_eq!(me.package_full_name().unwrap(), None);
+    }
+
+    #[test]
+    fn integrity_levels_come_from_the_label_rid_and_order_by_trust() {
+        assert_eq!(Integrity::from_rid(0x2000), Integrity::Medium);
+        assert_eq!(Integrity::from_rid(0x2100), Integrity::MediumPlus);
+        assert_eq!(Integrity::from_rid(0x4000), Integrity::System);
+        assert_eq!(Integrity::from_rid(0x2500), Integrity::Other(0x2500));
+        assert!(Integrity::Low < Integrity::Medium && Integrity::High < Integrity::System);
+    }
+
+    #[test]
+    fn this_test_process_reports_its_working_directory() {
+        let me = ProcessHandle::open(std::process::id(), Access::READ_PARAMETERS).unwrap();
+        let read = me.current_directory().unwrap();
+        let expected = std::env::current_dir().unwrap();
+        assert_eq!(
+            read.trim_end_matches(std::path::MAIN_SEPARATOR)
+                .to_lowercase(),
+            expected
+                .to_string_lossy()
+                .trim_end_matches(std::path::MAIN_SEPARATOR)
+                .to_lowercase()
+        );
+    }
+
+    #[test]
+    fn this_test_process_has_a_readable_integrity_level() {
+        let me = ProcessHandle::open(std::process::id(), Access::QUERY).unwrap();
+        let level = me.integrity().unwrap();
+        assert!(
+            matches!(
+                level,
+                Integrity::Medium | Integrity::High | Integrity::System
+            ),
+            "{level:?}"
+        );
+    }
+    use std::process::{Child, Command, Stdio};
+
+    /// Kills the child if a test fails half-way.
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn spawn_ping() -> ChildGuard {
+        let child = Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        ChildGuard(child)
+    }
+
+    #[test]
+    fn trims_the_working_set_of_a_child() {
+        let child = spawn_ping();
+        let h = ProcessHandle::open(child.0.id(), Access::QUERY | Access::SET_QUOTA).unwrap();
+        h.trim_working_set().unwrap();
+        let weak = ProcessHandle::open(child.0.id(), Access::QUERY).unwrap();
+        assert!(weak.trim_working_set().unwrap_err().is_access_denied());
+    }
+
+    #[test]
+    fn default_cpu_sets_and_working_set_floor_apply_to_a_child() {
+        let child = spawn_ping();
+        let access = Access::QUERY | Access::SET_LIMITED_INFORMATION | Access::SET_QUOTA;
+        let h = ProcessHandle::open(child.0.id(), access).unwrap();
+        assert!(h.default_cpu_sets().unwrap().is_empty());
+        let split = crate::cpu::topology().unwrap();
+        let first = split.cpus[0].id;
+        h.set_default_cpu_sets(&[first]).unwrap();
+        assert_eq!(h.default_cpu_sets().unwrap(), [first]);
+        h.set_default_cpu_sets(&[]).unwrap();
+        assert!(h.default_cpu_sets().unwrap().is_empty());
+        h.lock_working_set(8 << 20).unwrap();
+
+        let weak = ProcessHandle::open(child.0.id(), Access::QUERY).unwrap();
+        assert!(weak.set_default_cpu_sets(&[first]).is_err());
+        assert!(weak.set_normal_memory_priority().is_err());
+    }
+
+    #[test]
+    fn hardens_the_current_process_and_thread() {
+        let access = Access::QUERY | Access::SET_INFORMATION | Access::SET_QUOTA;
+        let h = ProcessHandle::open(std::process::id(), access).unwrap();
+        h.set_normal_memory_priority().unwrap();
+        h.lock_working_set(16 << 20).unwrap();
+        raise_current_thread().unwrap();
+        std::thread::spawn(|| enter_background_mode().unwrap())
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn writes_a_memory_dump_of_a_child() {
+        let child = spawn_ping();
+        let path = std::env::temp_dir().join(format!("wtm-dump-test-{}.dmp", std::process::id()));
+        // With the rights to clone it, the dump is written from a snapshot.
+        let h = ProcessHandle::open(child.0.id(), Access::DUMP_CLONE).unwrap();
+        assert!(h.write_dump(&path).unwrap(), "written from a clone");
+        let h = ProcessHandle::open(child.0.id(), Access::DUMP).unwrap();
+        assert!(
+            !h.write_dump(&path).unwrap(),
+            "live, without the clone rights"
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(&bytes[..4], b"MDMP");
+        assert!(
+            bytes.len() > 100_000,
+            "a full dump holds the memory: {}",
+            bytes.len()
+        );
+
+        // A file that cannot be created fails before anything is dumped.
+        let bad = std::env::temp_dir().join("no-such-dir-wtm").join("x.dmp");
+        assert!(h.write_dump(&bad).is_err());
+    }
+
+    #[test]
+    fn reads_command_line_and_user() {
+        let child = spawn_ping();
+        let h = ProcessHandle::open(child.0.id(), Access::QUERY).unwrap();
+        let cmd = h.command_line().unwrap();
+        assert!(cmd.to_lowercase().contains("ping"), "{cmd}");
+        assert!(cmd.ends_with("-n 60 127.0.0.1"), "{cmd}");
+        let user = h.user().unwrap();
+        assert!(user.contains('\\') && user.len() > 2, "{user}");
+
+        // A handle without query rights is refused, not misread.
+        let h = ProcessHandle::open(child.0.id(), Access::SYNCHRONIZE).unwrap();
+        assert!(h.command_line().unwrap_err().is_access_denied());
+        assert!(h.user().unwrap_err().is_access_denied());
+    }
+
+    #[test]
+    fn priority_classes_round_trip() {
+        for p in [
+            PriorityClass::Idle,
+            PriorityClass::BelowNormal,
+            PriorityClass::Normal,
+            PriorityClass::AboveNormal,
+            PriorityClass::High,
+            PriorityClass::Realtime,
+        ] {
+            assert_eq!(PriorityClass::from_raw(p.to_raw().0), Some(p));
+        }
+        assert_eq!(PriorityClass::from_raw(0), None);
+    }
+
+    #[test]
+    fn controls_spawned_child_and_waits_for_exit() {
+        let child = spawn_ping();
+        let pid = child.0.id();
+        let access = Access::QUERY | Access::SET_INFORMATION | Access::SYNCHRONIZE;
+        let h = ProcessHandle::open(pid, access | Access::TERMINATE).unwrap();
+        assert_eq!(h.pid(), pid);
+
+        for p in [
+            PriorityClass::AboveNormal,
+            PriorityClass::High,
+            PriorityClass::Normal,
+        ] {
+            h.set_priority(p).unwrap();
+            assert_eq!(h.priority().unwrap(), p);
+        }
+        h.set_eco_qos(EcoQos::Off).unwrap();
+        assert_eq!(h.eco_qos().unwrap(), EcoQos::Off);
+
+        assert!(!h.wait_exit(Duration::ZERO).unwrap(), "still running");
+        h.terminate(3).unwrap();
+        assert!(h.wait_exit(Duration::from_secs(10)).unwrap());
+    }
+
+    #[test]
+    fn calls_without_the_needed_access_fail() {
+        let child = spawn_ping();
+        let pid = child.0.id();
+        // The handle carries only the requested rights, even when elevated
+        // with SeDebugPrivilege, so every call below is refused.
+        let h = ProcessHandle::open(pid, Access::SYNCHRONIZE).unwrap();
+        assert!(h.image_path().is_err());
+        assert!(h.priority().is_err());
+        assert!(h.eco_qos().is_err());
+        assert!(h.set_eco_qos(EcoQos::On).is_err());
+        let e = h.suspend().unwrap_err();
+        assert!(e.is_access_denied(), "{e}");
+        assert!(e.to_string().starts_with("NtSuspendProcess failed"), "{e}");
+
+        // Waiting needs SYNCHRONIZE.
+        let q = ProcessHandle::open(pid, Access::QUERY).unwrap();
+        assert!(q.wait_exit(Duration::ZERO).is_err());
+    }
+}
